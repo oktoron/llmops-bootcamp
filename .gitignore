@@ -6,6 +6,10 @@
 # локальний зсув портів — не комітиться: CI очікує стандартні порти
 docker-compose.override.yml
 
+# слід виконання задач агентами (Tasks / Plans / Research / Critic / Tests /
+# Review / Devops) — локальний робочий журнал мейнтейнера, не частина курсу
+.agent/
+
 # python
 __pycache__/
 *.pyc
