@@ -15,6 +15,7 @@ import { ConsoleComponent } from './console.component';
           <span class="logo">◐</span>
           <span class="name">SupportGW</span>
           <span class="tag">LLMOps capstone</span>
+          <a *ngIf="swagger" class="tag api" href="/api/swagger/index.html" target="_blank" rel="noopener">API (Swagger)</a>
         </div>
         <div class="health" [class.ok]="healthy === true" [class.bad]="healthy === false">
           <span class="dot"></span>
@@ -35,6 +36,7 @@ import { ConsoleComponent } from './console.component';
       .logo { width: 34px; height: 34px; border-radius: 10px; background: #4038c4; color: #fff; display: grid; place-items: center; font-size: 18px; }
       .name { font-weight: 800; font-size: 19px; letter-spacing: -0.01em; }
       .tag { font-size: 12px; color: #8a90a0; background: #fff; border: 1px solid #e4e6ec; padding: 3px 9px; border-radius: 20px; }
+      .api { color: #4038c4; text-decoration: none; }
       .health { display: flex; align-items: center; gap: 7px; font-size: 13px; color: #8a90a0; }
       .health .dot { width: 9px; height: 9px; border-radius: 50%; background: #c2c6d0; }
       .health.ok { color: #177245; }
@@ -48,6 +50,8 @@ import { ConsoleComponent } from './console.component';
 })
 export class AppComponent implements OnInit, OnDestroy {
   healthy: boolean | null = null;
+  swagger = false; // посилання показуємо, лише якщо сервіс віддає специфікацію (advanced-режим)
+  private swaggerProbed = false;
   private timer: ReturnType<typeof setInterval> | null = null;
 
   constructor(private http: HttpClient) {}
@@ -55,7 +59,17 @@ export class AppComponent implements OnInit, OnDestroy {
   ngOnInit(): void {
     const check = () =>
       this.http.get('/api/health').subscribe({
-        next: () => (this.healthy = true),
+        next: () => {
+          this.healthy = true;
+          // одна проба після першого успішного health: сервіс міг піднятися пізніше за UI
+          if (!this.swaggerProbed) {
+            this.swaggerProbed = true;
+            this.http.get('/api/swagger/v1/swagger.json').subscribe({
+              next: () => (this.swagger = true),
+              error: () => (this.swagger = false),
+            });
+          }
+        },
         error: () => (this.healthy = false),
       });
     check();

@@ -1,8 +1,18 @@
-import { Component, OnDestroy, OnInit } from '@angular/core';
+import { Component, ElementRef, OnDestroy, OnInit, ViewChild } from '@angular/core';
 import { CommonModule } from '@angular/common';
 import { HttpClient } from '@angular/common/http';
 import { of } from 'rxjs';
 import { catchError } from 'rxjs/operators';
+
+// рядок GET /prompts. дати — ISO 8601 зі зсувом; DatePipe показує їх у локальному часі браузера
+interface PromptRow {
+  name: string;
+  version: string;
+  active: boolean;
+  activated_by: string | null;
+  created_at: string;
+  activated_at: string | null;  // null — версію ще жодного разу не активували
+}
 
 @Component({
   selector: 'app-console',
@@ -39,13 +49,46 @@ import { catchError } from 'rxjs/operators';
     <div class="card">
       <div class="ch">Prompt registry <span class="lens">L02</span></div>
       <ng-container *ngIf="prompts?.length; else emptyP">
-        <div class="row" *ngFor="let p of prompts">
-          <span class="mono">{{ p.name }}</span><span class="mono">{{ p.version }}</span>
-          <span class="badge" [class.on]="p.active">{{ p.active ? 'active' : 'archived' }}</span>
-          <button class="act" *ngIf="!p.active" (click)="activate(p.version)">зробити активною</button>
+        <!-- таблиця в обгортці зі скролом: у вузькій картці рядок не ламається, а прокручується -->
+        <div class="tbl-wrap">
+          <table class="reg">
+            <thead>
+              <tr><th>Версія</th><th>Статус</th><th>Створено</th><th>Активовано</th><th>Ким</th><th>Дії</th></tr>
+            </thead>
+            <tbody>
+              <tr *ngFor="let p of prompts; trackBy: trackPrompt" [class.on]="p.active">
+                <td class="mono" [attr.title]="p.name ? p.name + ' · ' + p.version : p.version">{{ p.version || '—' }}</td>
+                <td><span class="badge" [class.on]="p.active">{{ p.active ? 'active' : 'archived' }}</span></td>
+                <td class="mono by">{{ p.created_at ? (p.created_at | date: 'dd.MM.yyyy HH:mm') : '—' }}</td>
+                <td class="mono by">{{ p.activated_at ? (p.activated_at | date: 'dd.MM.yyyy HH:mm') : '—' }}</td>
+                <td class="by"><span class="trunc" *ngIf="p.activated_by; else dash" [attr.title]="p.activated_by">{{ p.activated_by }}</span></td>
+                <td>
+                  <div class="acts" *ngIf="!p.active; else dash">
+                    <button class="act" (click)="activate(p.version)">зробити активною</button>
+                    <button class="act" (click)="askName(p.version)">зробити активною від імені</button>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </div>
+        <ng-template #dash><span class="by">—</span></ng-template>
       </ng-container>
       <ng-template #emptyP><div class="empty">— очікує GET /prompts (HW1)</div></ng-template>
+    </div>
+
+    <!-- попап поза *ngFor: опитування кожні 4с перемальовує рядки, а тут введене не зітреться -->
+    <div class="modal-bg" *ngIf="pendingVersion" (click)="cancelActivate()">
+      <div class="modal" (click)="$event.stopPropagation()">
+        <div class="mh">Активувати <span class="mono">{{ pendingVersion }}</span> від імені</div>
+        <input #nameInput class="name-in" type="text" maxlength="100" placeholder="імʼя"
+               [value]="pendingName" (input)="pendingName = nameInput.value"
+               (keydown.enter)="confirmActivate()" (keydown.escape)="cancelActivate()" />
+        <div class="modal-actions">
+          <button class="act" (click)="cancelActivate()">скасувати</button>
+          <button class="act ok" [disabled]="!pendingName.trim()" (click)="confirmActivate()">активувати</button>
+        </div>
+      </div>
     </div>
 
     <div class="card">
@@ -90,11 +133,35 @@ import { catchError } from 'rxjs/operators';
       .lens { font-family: ui-monospace, monospace; font-size: 10px; color: #4038c4; background: #ecebfb; padding: 2px 7px; border-radius: 20px; }
       .row { display: flex; gap: 10px; align-items: center; font-size: 13px; padding: 4px 0; }
       .mono { font-family: ui-monospace, monospace; }
-      .badge { font-family: ui-monospace, monospace; font-size: 10px; text-transform: uppercase; padding: 2px 7px; border-radius: 20px; background: #eef0f4; color: #8a90a0; }
+      .badge { font-family: ui-monospace, monospace; font-size: 10px; text-transform: uppercase; padding: 2px 7px; border-radius: 20px; background: #eef0f4; color: #8a90a0; border: 1px solid transparent; }
       .badge.on { background: #e6f2ea; color: #177245; }
       .act { margin-left: auto; font-size: 11.5px; border: 1px solid #dfe1e8; background: #fff; border-radius: 7px; padding: 3px 10px; cursor: pointer; color: #565c6b; font-family: inherit; }
       .act:hover { border-color: #4038c4; color: #4038c4; }
       .act.ok:hover { border-color: #177245; color: #177245; }
+      .act + .act { margin-left: 0; }
+      .act:disabled { opacity: 0.5; cursor: default; border-color: #dfe1e8; color: #565c6b; }
+      .by { font-size: 12px; color: #8a90a0; }
+      .tbl-wrap { overflow-x: auto; }
+      .reg { width: 100%; border-collapse: collapse; font-size: 13px; }
+      .reg th { text-align: left; font-size: 11px; font-weight: 600; color: #8a90a0; text-transform: uppercase; letter-spacing: 0.04em; padding: 4px 8px; border-bottom: 1px solid #e4e6ec; white-space: nowrap; }
+      .reg td { padding: 5px 8px; border-bottom: 1px solid #eef0f4; vertical-align: middle; white-space: nowrap; }
+      .reg tbody tr:last-child td { border-bottom: none; }
+      /* активний рядок — тими ж кольорами, що й бейдж active */
+      .reg tr.on td { background: #e6f2ea; }
+      .reg tr.on td:first-child { box-shadow: inset 3px 0 0 #177245; font-weight: 700; color: #177245; }
+      /* рамка є в усіх бейджів (прозора), тож зелена не робить цей вищим за інші */
+      .reg tr.on .badge.on { background: #fff; border-color: #177245; }
+      /* max-width на td у таблиці ненадійний, тому обрізаємо вкладений inline-block */
+      .trunc { display: inline-block; max-width: 16ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
+      .acts { display: flex; gap: 6px; }
+      .acts .act { margin-left: 0; }
+      .mh { font-weight: 650; font-size: 14px; margin-bottom: 10px; }
+      .modal-bg { position: fixed; inset: 0; background: rgba(20,20,30,.25); display: flex; align-items: center; justify-content: center; z-index: 10; }
+      .modal { background: #fff; border: 1px solid #e4e6ec; border-radius: 12px; padding: 14px; width: 320px; box-shadow: 0 8px 24px rgba(20,20,30,.12); }
+      .name-in { width: 100%; box-sizing: border-box; font-size: 13px; font-family: inherit; border: 1px solid #dfe1e8; border-radius: 7px; padding: 6px 9px; }
+      .name-in:focus { outline: none; border-color: #4038c4; }
+      .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+      .modal-actions .act { margin-left: 0; }
       .prov { display: flex; align-items: center; font-size: 13px; padding: 4px 0; }
       .dot { width: 8px; height: 8px; border-radius: 50%; background: #177245; display: inline-block; margin-right: 8px; }
       .dot.down { background: #b3261e; }
@@ -107,10 +174,17 @@ export class ConsoleComponent implements OnInit, OnDestroy {
   intervalSec = 4;
   obs: any = null;
   cost: any = null;
-  prompts: any[] | null = null;
+  prompts: PromptRow[] | null = null;
   providers: any[] | null = null;
   approvals: any[] | null = null;
+  pendingVersion: string | null = null;  // версія, для якої відкрито попап «від імені»
+  pendingName = '';
   private timer: ReturnType<typeof setInterval> | null = null;
+
+  // фокус у поле, щойно попап зʼявився (атрибут autofocus на динамічних елементах ненадійний)
+  @ViewChild('nameInput') set nameInputRef(el: ElementRef<HTMLInputElement> | undefined) {
+    el?.nativeElement.focus();
+  }
 
   constructor(private http: HttpClient) {}
 
@@ -139,11 +213,36 @@ export class ConsoleComponent implements OnInit, OnDestroy {
     });
   }
 
-  activate(version: string): void {
-    this.http.post('/api/prompts/' + version + '/activate', {}).subscribe({
+  // імʼя йде в тілі, а не в X-Activated-By: браузер не пускає кирилицю в заголовки
+  activate(version: string, by?: string): void {
+    this.http.post('/api/prompts/' + version + '/activate', by ? { activated_by: by } : {}).subscribe({
       next: () => this.refresh(),
       error: () => this.refresh(),
     });
+  }
+
+  askName(version: string): void {
+    this.pendingVersion = version;
+    this.pendingName = '';
+  }
+
+  // порожнє імʼя не шлемо: для активації без імені є звичайна кнопка
+  confirmActivate(): void {
+    const name = this.pendingName.trim();
+    if (!this.pendingVersion || !name) return;
+    this.activate(this.pendingVersion, name);
+    this.cancelActivate();
+  }
+
+  // скасування нічого не надсилає
+  cancelActivate(): void {
+    this.pendingVersion = null;
+    this.pendingName = '';
+  }
+
+  // ключ рядка: без нього опитування кожні 4с перестворює <tr> — гаснуть підказки title, губляться кліки
+  trackPrompt(_: number, p: PromptRow): string {
+    return p.name + '\u0000' + p.version;
   }
 
   isNum(v: unknown): boolean {
