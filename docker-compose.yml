@@ -11,6 +11,7 @@ services:
       - GATEWAY_URL=http://gateway:4000
       - DB_CONN=Host=postgres;Database=llmops;Username=llmops;Password=llmops
       - MODEL=${MODEL:-mock}   # mock (за замовч.) або gpt-5-mini / claude-haiku (потрібен ключ у gateway/.env)
+      - COMPOSE_PROFILES=${COMPOSE_PROFILES:-}   # вмикає Swagger, коли містить "advanced"
     depends_on: [gateway, postgres]
 
   gateway:
