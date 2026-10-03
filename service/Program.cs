@@ -2,6 +2,7 @@
 // (яку модель брати, коли ретраїти, скільки коштує) робимо тут.
 // MODEL=mock — дефолт, грошей не треба. MODEL=gpt-5-mini або claude-haiku + ключ у gateway/.env — реальна модель.
 
+using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -10,9 +11,9 @@ using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddHttpClient();
-// Swagger — лише в advanced-режимі (COMPOSE_PROFILES містить advanced), для мейнтейнерів
-var swaggerOn = (Environment.GetEnvironmentVariable("COMPOSE_PROFILES") ?? "")
-    .Split(',', StringSplitOptions.TrimEntries).Contains("advanced");
+// Swagger — для мейнтейнерів, вмикається лише SWAGGER_ENABLED=true або 1 (за замовч. вимкнено)
+var swaggerFlag = (Environment.GetEnvironmentVariable("SWAGGER_ENABLED") ?? "").Trim();
+var swaggerOn = swaggerFlag == "1" || swaggerFlag.Equals("true", StringComparison.OrdinalIgnoreCase);
 if (swaggerOn)
 {
     builder.Services.AddEndpointsApiExplorer();
@@ -39,6 +40,99 @@ var gateway = Environment.GetEnvironmentVariable("GATEWAY_URL") ?? "http://gatew
 var dbConn = Environment.GetEnvironmentVariable("DB_CONN")
     ?? "Host=postgres;Database=llmops;Username=llmops;Password=llmops";
 var defaultModel = Environment.GetEnvironmentVariable("MODEL") ?? "mock";
+// денний бюджет для картки Cost. без BUDGET_USD (або з непарсабельним значенням) — $5
+var budgetUsd = decimal.TryParse(Environment.GetEnvironmentVariable("BUDGET_USD"),
+    NumberStyles.Number, CultureInfo.InvariantCulture, out var budget) ? budget : 5m;
+
+// routing (W2): моделі названі за роллю, а не за провайдером — так само, як у gateway/litellm-config.yaml
+const string MiniModel = "mock-mini";
+const string StrongModel = "mock-strong";
+// третій маршрут (W2, опційно): середній tier для питань про замовлення й доставку —
+// там модель має впевнено викликати інструмент, але це ще не ескалація
+const string MidModel = "mock-mid";
+
+// fallback chain: mock-strong -> mock-mid -> mock-mini -> контрольована помилка. Поки це лише рядок — на W4 він стане кодом.
+// кожен tier падає на наступний дешевший; mock-mid стартує з другого кроку, mock-mini — з третього.
+// mock-mini і mock-mid живуть на тому ж провайдері, що й mock-strong, тож падіння провайдера цей ланцюжок не переживе.
+// Провайдер з іншим ключем (gemini — закоментований блок у gateway/litellm-config.yaml) стає
+// другим кроком: mock-strong -> gemini -> mock-mid -> mock-mini -> контрольована помилка.
+const string FallbackChain = "mock-strong -> mock-mid -> mock-mini -> контрольована помилка";
+
+// budget-політика (W2, опційно): з 80% денного бюджету (BUDGET_USD) — алерт у лог і деградація на mock-mini
+const decimal BudgetAlertShare = 0.8m;
+
+// обирає модель за задачею. Порядок: реальна модель із MODEL -> бюджет -> ескалація -> замовлення -> решта.
+// Реальну модель із MODEL не чіпаємо: її обрав власник конфігурації.
+// понад поріг бюджету все йде на найдешевшу mock-mini — навіть ескалації: бюджет важливіший за tier.
+// ескалації (повернення грошей, терміново, скарги) — на mock-strong; замовлення/доставка — на mock-mid;
+// решта — на дешеву mock-mini. Ескалація перемагає замовлення: «поверніть гроші за замовлення» — це mock-strong.
+static string Route(string message, string defaultModel, bool overBudget)
+{
+    if (defaultModel != "mock")
+        return defaultModel;
+    if (overBudget || string.IsNullOrEmpty(message))
+        return MiniModel;
+    // основи слів, щоб ловити різні форми: «поверніть», «повернення», «терміново», «термінове», «скаргу», «скаржусь», «complaint»
+    string[] markers = { "поверн", "термінов", "скарг", "скарж", "refund", "urgent", "complain" };
+    // OrdinalIgnoreCase у .NET 8 зводить регістр і для кирилиці: «Поверніть» теж ловиться
+    if (markers.Any(m => message.Contains(m, StringComparison.OrdinalIgnoreCase)))
+        return StrongModel;
+    // «замовлення», «замовленню», «доставка», «доставку», «посилка», «order», «delivery»
+    string[] orderMarkers = { "замовлен", "доставк", "посилк", "order", "delivery" };
+    return orderMarkers.Any(m => message.Contains(m, StringComparison.OrdinalIgnoreCase)) ? MidModel : MiniModel;
+}
+
+// cost (W2): ціни в USD за 1k токенів, вхід і вихід окремо. mock-strong ≈ 16× дорожча за mock-mini,
+// mock-mid — посередині (4× mini, ≈ 4× дешевша за strong).
+// ціни — живі дані: зміна ціни йде PR-ом, як виправлення бага.
+// не опускати нижче: cost_usd — NUMERIC(10,6), і дешевий запит на mock-mini округлився б до 0.
+// немає ціни (реальна модель з MODEL) — null, тобто "невідомо", а не 0: 0 лишаємо для cache hit (W3).
+// ОБМЕЖЕННЯ: ціни (а з ними й budget-політика) є лише для mock-моделей. Реальна модель пише
+// cost_usd = NULL, а SUM у /cost його пропускає — тож ні картка Cost, ні алерт бюджету її витрат не бачать.
+static decimal? CostUsd(string model, int promptTokens, int completionTokens)
+{
+    (decimal In, decimal Out)? price = model switch
+    {
+        MiniModel => (0.00015m, 0.0006m),
+        MidModel => (0.0006m, 0.0024m),
+        StrongModel => (0.0025m, 0.01m),
+        _ => null
+    };
+    return price is { } p ? (promptTokens * p.In + completionTokens * p.Out) / 1000m : null;
+}
+
+// день (UTC), за який алерт бюджету вже писали: лог раз на добу, а не на кожен запит.
+// гонка двох запитів дасть щонайбільше дубль рядка в лозі — це не шкодить.
+var budgetAlertDay = DateTime.MinValue;
+
+// чи витрати за сьогодні вже досягли 80% бюджету. те саме "сьогодні", що й у GET /cost (див. BudgetSpentToday()).
+// база недоступна — це не причина валити запит: маршрутизуємо без budget-політики.
+// працює лише на mock: реальна модель не має ціни в CostUsd(), тож бюджет її витрат не рахує.
+async Task<bool> OverBudget()
+{
+    // реальну модель Route() не чіпає, тож і зайвий запит у БД ні до чого
+    if (defaultModel != "mock")
+        return false;
+    try
+    {
+        var spent = await BudgetSpentToday(dbConn);
+        if (spent < budgetUsd * BudgetAlertShare)
+            return false;
+        if (budgetAlertDay != DateTime.UtcNow.Date)
+        {
+            budgetAlertDay = DateTime.UtcNow.Date;
+            app.Logger.LogWarning("budget alert: spent {Spent} USD today, threshold {Share} of budget {Budget} USD reached; routing degraded to {Model}",
+                spent, BudgetAlertShare, budgetUsd, MiniModel);
+        }
+        return true;
+    }
+    catch (Exception ex)
+    {
+        // один рядок без стек-трейсу: при збої БД це спрацює на кожен /chat
+        app.Logger.LogWarning("budget check failed ({Error}), routing without budget policy", ex.Message);
+        return false;
+    }
+}
 
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
@@ -48,8 +142,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
     // TODO(student, W4)
 
-    // routing (W2): поки одна модель, а треба обирати за задачею
-    var model = defaultModel;  // TODO(student, W2)
+    // routing (W2): модель обираємо за задачею і бюджетом (див. Route(), OverBudget())
+    var model = Route(body.Message, defaultModel, await OverBudget());
 
     // промпт (W1): активну версію беремо з реєстру (таблиця prompts)
     string promptVersion, systemPrompt;
@@ -84,6 +178,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     var answer = "";
     string? toolCall = null;
     int promptTokens = 0, completionTokens = 0, status = 0; // 0 = відповіді не було
+    var usageParsed = false;  // без usage вартість невідома — пишемо NULL, а не 0
     try
     {
         var response = await http.PostAsync(
@@ -108,6 +203,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         var usage = doc.RootElement.GetProperty("usage");
         promptTokens = usage.GetProperty("prompt_tokens").GetInt32();
         completionTokens = usage.GetProperty("completion_tokens").GetInt32();
+        usageParsed = true;
     }
     catch
     {
@@ -118,8 +214,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
 
-    // cost (W2): порахувати tokens * ціна і покласти в cost_usd
-    decimal? costUsd = null;  // TODO(student, W2)
+    // cost (W2): tokens * ціна моделі (див. CostUsd()); NULL, якщо ціни чи usage немає
+    var costUsd = usageParsed ? CostUsd(model, promptTokens, completionTokens) : null;
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
     await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
@@ -130,7 +226,20 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
 app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));  // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
-app.MapGet("/cost", () => Results.Json(new { todo = "sum cost_usd for today + budget" }));         // W2/W5: { today_usd, budget_usd }
+app.MapGet("/cost", async () =>                                                                    // W2/W5: { today_usd, budget_usd }
+{
+    // сума рахується в SQL з тим самим created_at::date = CURRENT_DATE, що й у перевірці ментора,
+    // щоб "сьогодні" визначала база, а не годинник контейнера сервісу
+    try
+    {
+        return Results.Json(new { today_usd = await CostToday(dbConn), budget_usd = budgetUsd });
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogError(ex, "requests table unavailable, GET /cost failed");
+        return Results.Json(new { error = "cost unavailable" }, statusCode: 503);
+    }
+});
 app.MapGet("/prompts", async () =>                                                                 // W1/W2: [ { name, version, active, activated_by, created_at, activated_at } ]
 {
     // усі версії, не лише активна: консоль показує і поточну, і попередні
@@ -171,7 +280,32 @@ app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest re
 app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
 app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
 
+app.Logger.LogInformation("MODEL={Model}, fallback chain: {Chain}", defaultModel, FallbackChain);
 app.Run("http://0.0.0.0:8080");
+
+// витрати за сьогодні. COALESCE: немає рядків чи всі cost_usd NULL — це 0, а не null.
+// помилку БД не ковтаємо — ендпоінт віддасть 503.
+static async Task<decimal> CostToday(string conn)
+{
+    await using var db = new NpgsqlConnection(conn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT COALESCE(SUM(cost_usd), 0) FROM requests WHERE created_at::date = CURRENT_DATE", db);
+    return Convert.ToDecimal(await cmd.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
+}
+
+// та сама сума за сьогодні для budget-політики, що йде на кожен /chat. Діапазон замість
+// created_at::date: "сьогодні" так само за часовим поясом сесії БД, але запит може йти
+// індексом idx_requests_created_at. помилку БД не ковтаємо — її ловить OverBudget().
+static async Task<decimal> BudgetSpentToday(string conn)
+{
+    await using var db = new NpgsqlConnection(conn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT COALESCE(SUM(cost_usd), 0) FROM requests "
+        + "WHERE created_at >= CURRENT_DATE AND created_at < CURRENT_DATE + 1", db);
+    return Convert.ToDecimal(await cmd.ExecuteScalarAsync(), CultureInfo.InvariantCulture);
+}
 
 // дістає активний промпт із реєстру.
 // читаємо на КОЖЕН запит, а не один раз на старті: інакше активація нової версії чи
@@ -184,7 +318,7 @@ static async Task<(string Version, string Body)> GetActivePrompt(string conn)
     await using var db = new NpgsqlConnection(conn);
     await db.OpenAsync();
     await using var cmd = new NpgsqlCommand(
-        "SELECT version, body FROM prompts WHERE active = true ORDER BY created_at DESC LIMIT 1", db);
+        "SELECT version, body FROM prompts WHERE name = 'support-system' AND active = true ORDER BY created_at DESC LIMIT 1", db);
     await using var reader = await cmd.ExecuteReaderAsync();
     if (await reader.ReadAsync())
         return (reader.GetString(0), reader.GetString(1));
