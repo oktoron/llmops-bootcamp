@@ -8,13 +8,20 @@ model_list:
       api_base: http://mock-provider:9000/v1
       api_key: "sk-mock"
 
-  # дві "моделі" на mock — щоб routing (W2) мав із чого обирати без реального ключа
+  # три "моделі" на mock — щоб routing (W2) мав із чого обирати без реального ключа.
+  # усі шлють у mock-provider той самий openai/mock: tier розрізняє лише назва тут, у сервісі й у прайсі
   - model_name: mock-mini
     litellm_params:
       model: openai/mock
       api_base: http://mock-provider:9000/v1
       api_key: "sk-mock"
   - model_name: mock-strong
+    litellm_params:
+      model: openai/mock
+      api_base: http://mock-provider:9000/v1
+      api_key: "sk-mock"
+  # третій маршрут (W2, опційно): середній tier для замовлень/доставки
+  - model_name: mock-mid
     litellm_params:
       model: openai/mock
       api_base: http://mock-provider:9000/v1
@@ -55,6 +62,18 @@ model_list:
       api_base: os.environ/AZURE_API_BASE
       api_key: os.environ/AZURE_API_KEY
       api_version: os.environ/AZURE_API_VERSION
+
+  # Новий провайдер (W2, крок 4) — Google Gemini. Вимкнено: потрібен GEMINI_API_KEY
+  # у gateway/.env, а обовʼязковий трек працює лише на mock. Щоб підключити — розкоментувати
+  # блок і додати "gemini" у fallback-ланцюжок сервісу другим кроком:
+  # mock-strong -> gemini -> mock-mid -> mock-mini -> контрольована помилка (інший провайдер, ніж у mock-*).
+  # Змінюється цей блок, політика маршрутизації (Route() / FallbackChain) і рядок ціни
+  # для gemini в CostUsd() сервісу — без нього cost_usd = NULL, і витрати gemini випадуть
+  # з /cost та бюджету. Спільний код виклику моделі в /chat лишається без змін.
+  # - model_name: gemini
+  #   litellm_params:
+  #     model: gemini/gemini-3.7-flash
+  #     api_key: os.environ/GEMINI_API_KEY
 
 litellm_settings:
   drop_params: true

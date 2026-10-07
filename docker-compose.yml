@@ -11,7 +11,8 @@ services:
       - GATEWAY_URL=http://gateway:4000
       - DB_CONN=Host=postgres;Database=llmops;Username=llmops;Password=llmops
       - MODEL=${MODEL:-mock}   # mock (за замовч.) або gpt-5-mini / claude-haiku (потрібен ключ у gateway/.env)
-      - COMPOSE_PROFILES=${COMPOSE_PROFILES:-}   # вмикає Swagger, коли містить "advanced"
+      - SWAGGER_ENABLED=${SWAGGER_ENABLED:-false}   # Swagger для мейнтейнерів: true або 1 вмикає (за замовч. вимкнено)
+      - BUDGET_USD=${BUDGET_USD:-5}   # денний бюджет у USD: GET /cost і budget-політика (з 80% — деградація на mock-mini)
     depends_on: [gateway, postgres]
 
   gateway:
