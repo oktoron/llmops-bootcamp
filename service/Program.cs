@@ -43,6 +43,14 @@ var defaultModel = Environment.GetEnvironmentVariable("MODEL") ?? "mock";
 // денний бюджет для картки Cost. без BUDGET_USD (або з непарсабельним значенням) — $5
 var budgetUsd = decimal.TryParse(Environment.GetEnvironmentVariable("BUDGET_USD"),
     NumberStyles.Number, CultureInfo.InvariantCulture, out var budget) ? budget : 5m;
+// cache (W3): скільки живе закешована відповідь. без CACHE_TTL_SECONDS (або з нулем/сміттям) — 600 с
+var cacheTtlSeconds = int.TryParse(Environment.GetEnvironmentVariable("CACHE_TTL_SECONDS"), out var ttl) && ttl > 0 ? ttl : 600;
+// tools (W3): бюджет часу на один виклик інструмента — спільний для всіх номерів у ньому (до 3), а не на кожен. без TOOL_TIMEOUT_MS (або з нулем/сміттям) — 2000 мс
+var toolTimeoutMs = int.TryParse(Environment.GetEnvironmentVariable("TOOL_TIMEOUT_MS"), out var tt) && tt > 0 ? tt : 2000;
+
+// один кеш і один виконавець інструментів на процес (див. ResponseCache.cs, Tools.cs)
+var responseCache = new ResponseCache(TimeSpan.FromSeconds(cacheTtlSeconds));
+var toolRunner = new ToolRunner(new FakeOrderStore(), TimeSpan.FromMilliseconds(toolTimeoutMs));
 
 // routing (W2): моделі названі за роллю, а не за провайдером — так само, як у gateway/litellm-config.yaml
 const string MiniModel = "mock-mini";
@@ -134,6 +142,54 @@ async Task<bool> OverBudget()
     }
 }
 
+// один виклик моделі через gateway — фабрика для single-flight у ResponseCache.GetOrCallAsync.
+// ніколи не кидає: збій — це вибачення з UsageParsed = false (status лишиться 0/5xx).
+// без RequestAborted свідомо: результат можуть чекати інші запити, і відключення одного клієнта
+// не має скасувати спільний виклик.
+async Task<ModelCall> CallModel(IHttpClientFactory httpFactory, string model, ChatMessage[] messages)
+{
+    // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
+    // TODO(student, W4)
+    var payload = JsonSerializer.Serialize(new { model, messages });
+    var status = 0;  // 0 = відповіді не було
+
+    var http = httpFactory.CreateClient();
+    try
+    {
+        var response = await http.PostAsync(
+            $"{gateway}/v1/chat/completions",
+            new StringContent(payload, Encoding.UTF8, "application/json"));
+        status = (int)response.StatusCode;
+        var rawJson = await response.Content.ReadAsStringAsync();
+
+        using var doc = JsonDocument.Parse(rawJson);
+        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
+        var answer = message.GetProperty("content").GetString() ?? "";
+
+        // tools (W3): читаємо назву і аргументи першого tool call; виконання — у /chat, спільне для hit, miss і очікування
+        string? toolCall = null, toolArgs = null;
+        if (message.TryGetProperty("tool_calls", out var tools)
+            && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
+        {
+            var function = tools[0].GetProperty("function");
+            toolCall = function.GetProperty("name").GetString();
+            toolArgs = function.TryGetProperty("arguments", out var a) && a.ValueKind == JsonValueKind.String
+                ? a.GetString() : null;
+        }
+
+        var usage = doc.RootElement.GetProperty("usage");
+        return new ModelCall(new CachedReply(answer, toolCall, toolArgs), status, true,
+            usage.GetProperty("prompt_tokens").GetInt32(), usage.GetProperty("completion_tokens").GetInt32());
+    }
+    catch
+    {
+        // мережа/gateway недоступні або відповідь не розпарсилась. без usage вартість невідома — NULL, а не 0.
+        // TODO(student, W4): тут краще graceful degradation
+        // інструмент до вибачення не виконуємо: відповіді моделі фактично немає (tool call = null)
+        return new ModelCall(new CachedReply("Сервіс тимчасово недоступний.", null, null), status, false, 0, 0);
+    }
+}
+
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
     var requestId = Guid.NewGuid();
@@ -159,63 +215,66 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         return Results.Json(new { request_id = requestId, error = "prompt registry unavailable" }, statusCode: 503);
     }
 
-    // cache (W3): перед викликом глянути в Redis — раптом вже відповідали
-    // TODO(student, W3)
+    // те, що піде в модель. з цього ж масиву (разом із моделлю й версією промпта) рахується ключ кешу
+    var messages = new[] { new ChatMessage("system", systemPrompt), new ChatMessage("user", body.Message) };
 
-    // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
-    // TODO(student, W4)
-    var payload = JsonSerializer.Serialize(new
-    {
-        model,
-        messages = new object[]
+    int promptTokens = 0, completionTokens = 0, status;
+    decimal? costUsd;
+
+    // cache (W3): повтор того самого запиту (модель + промпт + повідомлення) після відповіді в модель не ходить —
+    // його віддає кеш. однакові запити, що прийшли одночасно, теж не множать викликів: модель викликає лише
+    // перший, решта чекають його результат (single-flight, див. ResponseCache.GetOrCallAsync).
+    // hit і очікування пишемо в requests з 0 токенів — власного виклику моделі в них не було.
+    var cacheKey = ResponseCache.Key(model, promptVersion, messages);
+    var lookup = await responseCache.GetOrCallAsync(cacheKey, () => CallModel(httpFactory, model, messages));
+    app.Logger.LogInformation("cache {Result} for request {RequestId}: hits={Hits} misses={Misses}",
+        lookup.Source switch
         {
-            new { role = "system", content = systemPrompt },
-            new { role = "user", content = body.Message }
-        }
-    });
+            CacheSource.Hit => "hit",
+            CacheSource.Joined => "hit (waited for an identical in-flight request)",
+            CacheSource.JoinedFailed => "miss (waited for an identical in-flight request that failed)",
+            _ => "miss"
+        }, requestId, responseCache.Hits, responseCache.Misses);
 
-    var http = httpFactory.CreateClient();
-    var answer = "";
-    string? toolCall = null;
-    int promptTokens = 0, completionTokens = 0, status = 0; // 0 = відповіді не було
-    var usageParsed = false;  // без usage вартість невідома — пишемо NULL, а не 0
-    try
+    var (answer, toolCall, toolArgs) = (lookup.Reply.Content, lookup.Reply.ToolName, lookup.Reply.ToolArguments);
+    if (lookup.Source == CacheSource.Miss && lookup.Call is { } call)
     {
-        var response = await http.PostAsync(
-            $"{gateway}/v1/chat/completions",
-            new StringContent(payload, Encoding.UTF8, "application/json"));
-        status = (int)response.StatusCode;
-        var rawJson = await response.Content.ReadAsStringAsync();
-
-        using var doc = JsonDocument.Parse(rawJson);
-        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
-        answer = message.GetProperty("content").GetString() ?? "";
-
-        // tools + HITL (W3/W4): якщо модель попросила інструмент — виконати;
-        // перед незворотною дією (створити тікет) спитати людину. поки лише читаємо назву.
-        // TODO(student, W3/W4)
-        if (message.TryGetProperty("tool_calls", out var tools)
-            && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
-        {
-            toolCall = tools[0].GetProperty("function").GetProperty("name").GetString();
-        }
-
-        var usage = doc.RootElement.GetProperty("usage");
-        promptTokens = usage.GetProperty("prompt_tokens").GetInt32();
-        completionTokens = usage.GetProperty("completion_tokens").GetInt32();
-        usageParsed = true;
+        // токени й вартість пише лише той запит, що сам викликав модель
+        status = call.Status;
+        (promptTokens, completionTokens) = (call.PromptTokens, call.CompletionTokens);
+        // cost (W2): tokens * ціна моделі (див. CostUsd()); NULL, якщо ціни чи usage немає
+        costUsd = call.UsageParsed ? CostUsd(model, promptTokens, completionTokens) : null;
     }
-    catch
+    else
     {
-        // мережа/gateway недоступні або відповідь не розпарсилась (status лишиться 0/5xx).
-        // TODO(student, W4): тут краще graceful degradation
-        answer = "Сервіс тимчасово недоступний.";
+        // hit або очікування вдалого виклику (Joined): 200 і cost_usd = 0.
+        // очікування невдалого виклику (JoinedFailed, у лічильниках це miss): статус лідера і cost_usd = NULL —
+        // щоб збій у W5 не порахувався як hit. правило збою одне — ResponseCache.Succeeded().
+        status = lookup.Call?.Status ?? 200;
+        costUsd = lookup.Source == CacheSource.JoinedFailed ? null : 0m;
+    }
+
+    // tools + HITL (W3/W4): lookup_order виконуємо (з timeout і валідацією номера, див. Tools.cs) і
+    // дописуємо результат до відповіді. виконується на кожному запиті — і на hit, і на очікуванні:
+    // single-flight об'єднує лише виклики моделі, не інструменти.
+    // create_ticket — незворотна дія: перед нею спитати людину.
+    // TODO(student, W4)
+    if (toolCall != null)
+    {
+        var tool = await toolRunner.RunAsync(toolCall, toolArgs, body.Message);
+        answer += tool.Suffix;
+        var notChecked = tool.NotChecked > 0 ? $", {tool.NotChecked} more not checked (limit {ToolRunner.MaxOrderIds})" : "";
+        if (tool.Outcome is ToolOutcome.Ok or ToolOutcome.NotFound or ToolOutcome.NotExecuted)
+            app.Logger.LogInformation("tool {Tool} for request {RequestId}: {Outcome}, orders {Orders}{NotChecked}",
+                toolCall, requestId, tool.Outcome, tool.Describe(), notChecked);
+        else
+            app.Logger.LogWarning("tool {Tool} for request {RequestId}: {Outcome}, orders {Orders}{NotChecked}{Detail}",
+                toolCall, requestId, tool.Outcome, tool.Describe(), notChecked,
+                tool.Outcome == ToolOutcome.ValidationRejected ? " (validation: no valid order number in arguments or message, not executed)"
+                : tool.Outcome == ToolOutcome.Timeout ? $" (timeout {toolTimeoutMs} ms for the whole tool call)" : "");
     }
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
-
-    // cost (W2): tokens * ціна моделі (див. CostUsd()); NULL, якщо ціни чи usage немає
-    var costUsd = usageParsed ? CostUsd(model, promptTokens, completionTokens) : null;
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
     await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
