@@ -47,24 +47,42 @@ var budgetUsd = decimal.TryParse(Environment.GetEnvironmentVariable("BUDGET_USD"
 var cacheTtlSeconds = int.TryParse(Environment.GetEnvironmentVariable("CACHE_TTL_SECONDS"), out var ttl) && ttl > 0 ? ttl : 600;
 // tools (W3): бюджет часу на один виклик інструмента — спільний для всіх номерів у ньому (до 3), а не на кожен. без TOOL_TIMEOUT_MS (або з нулем/сміттям) — 2000 мс
 var toolTimeoutMs = int.TryParse(Environment.GetEnvironmentVariable("TOOL_TIMEOUT_MS"), out var tt) && tt > 0 ? tt : 2000;
+// fallback (W4): бюджет часу на одну спробу моделі; минув — перемикаємось на наступну. без MODEL_ATTEMPT_TIMEOUT_MS (або з нулем/сміттям) — 30000 мс
+var attemptTimeoutMs = int.TryParse(Environment.GetEnvironmentVariable("MODEL_ATTEMPT_TIMEOUT_MS"), out var at) && at > 0
+    ? at : (int)ModelClient.DefaultAttemptTimeout.TotalMilliseconds;
+// circuit breaker (W4, опційно): скільки збоїв поспіль відкривають модель, верхня межа «відкритості» і як часто
+// пускати пробний запит. без CIRCUIT_FAILURE_THRESHOLD / CIRCUIT_OPEN_SECONDS / CIRCUIT_PROBE_INTERVAL_SECONDS
+// (або з нулем/сміттям) — 3 збої, 30 с, 5 с
+var circuitDefaults = CircuitOptions.Default;
+var circuitOptions = new CircuitOptions(
+    int.TryParse(Environment.GetEnvironmentVariable("CIRCUIT_FAILURE_THRESHOLD"), out var cft) && cft > 0
+        ? cft : circuitDefaults.FailureThreshold,
+    int.TryParse(Environment.GetEnvironmentVariable("CIRCUIT_OPEN_SECONDS"), out var cos) && cos > 0
+        ? TimeSpan.FromSeconds(cos) : circuitDefaults.OpenDuration,
+    int.TryParse(Environment.GetEnvironmentVariable("CIRCUIT_PROBE_INTERVAL_SECONDS"), out var cpi) && cpi > 0
+        ? TimeSpan.FromSeconds(cpi) : circuitDefaults.ProbeInterval);
 
-// один кеш і один виконавець інструментів на процес (див. ResponseCache.cs, Tools.cs)
+// один кеш, один виконавець інструментів і один клієнт моделі (з лічильником fallback) на процес
+// (див. ResponseCache.cs, Tools.cs, ModelClient.cs)
 var responseCache = new ResponseCache(TimeSpan.FromSeconds(cacheTtlSeconds));
 var toolRunner = new ToolRunner(new FakeOrderStore(), TimeSpan.FromMilliseconds(toolTimeoutMs));
+var modelClient = new ModelClient(app.Services.GetRequiredService<IHttpClientFactory>(), gateway,
+    TimeSpan.FromMilliseconds(attemptTimeoutMs), app.Logger,
+    circuitOptions, TimeProvider.System, ModelClient.ChainModels(defaultModel));
 
 // routing (W2): моделі названі за роллю, а не за провайдером — так само, як у gateway/litellm-config.yaml
-const string MiniModel = "mock-mini";
-const string StrongModel = "mock-strong";
+const string MiniModel = ModelClient.MiniModel;
+const string StrongModel = ModelClient.StrongModel;
 // третій маршрут (W2, опційно): середній tier для питань про замовлення й доставку —
 // там модель має впевнено викликати інструмент, але це ще не ескалація
-const string MidModel = "mock-mid";
+const string MidModel = ModelClient.MidModel;
 
-// fallback chain: mock-strong -> mock-mid -> mock-mini -> контрольована помилка. Поки це лише рядок — на W4 він стане кодом.
-// кожен tier падає на наступний дешевший; mock-mid стартує з другого кроку, mock-mini — з третього.
-// mock-mini і mock-mid живуть на тому ж провайдері, що й mock-strong, тож падіння провайдера цей ланцюжок не переживе.
-// Провайдер з іншим ключем (gemini — закоментований блок у gateway/litellm-config.yaml) стає
-// другим кроком: mock-strong -> gemini -> mock-mid -> mock-mini -> контрольована помилка.
-const string FallbackChain = "mock-strong -> mock-mid -> mock-mini -> контрольована помилка";
+// fallback chain (W4): для кожного tier свій ланцюжок — ModelClient.Chain():
+// mock-strong -> mock-mid -> mock-mini, mock-mid -> mock-mini, mock-mini -> mock-mid, далі — DegradedReply.
+// понад бюджет mock-mini — без кроку на дорожчу mock-mid: mock-mini -> DegradedReply.
+// перемикаємось лише на 0 (немає відповіді/timeout), 429, 5xx і 200, що не розпарсився; на 4xx — ні.
+// circuit breaker (див. CircuitBreaker.cs): модель після кількох таких збоїв поспіль відкрита — її пропускаємо без виклику,
+// доки не вдасться пробний запит. усі моделі ланцюжка відкриті — одразу DegradedReply зі статусом 503.
 
 // budget-політика (W2, опційно): з 80% денного бюджету (BUDGET_USD) — алерт у лог і деградація на mock-mini
 const decimal BudgetAlertShare = 0.8m;
@@ -72,6 +90,7 @@ const decimal BudgetAlertShare = 0.8m;
 // обирає модель за задачею. Порядок: реальна модель із MODEL -> бюджет -> ескалація -> замовлення -> решта.
 // Реальну модель із MODEL не чіпаємо: її обрав власник конфігурації.
 // понад поріг бюджету все йде на найдешевшу mock-mini — навіть ескалації: бюджет важливіший за tier.
+// fallback теж лишається на mini: понад бюджет ModelClient.Chain() не переходить на дорожчу mock-mid.
 // ескалації (повернення грошей, терміново, скарги) — на mock-strong; замовлення/доставка — на mock-mid;
 // решта — на дешеву mock-mini. Ескалація перемагає замовлення: «поверніть гроші за замовлення» — це mock-strong.
 static string Route(string message, string defaultModel, bool overBudget)
@@ -142,55 +161,7 @@ async Task<bool> OverBudget()
     }
 }
 
-// один виклик моделі через gateway — фабрика для single-flight у ResponseCache.GetOrCallAsync.
-// ніколи не кидає: збій — це вибачення з UsageParsed = false (status лишиться 0/5xx).
-// без RequestAborted свідомо: результат можуть чекати інші запити, і відключення одного клієнта
-// не має скасувати спільний виклик.
-async Task<ModelCall> CallModel(IHttpClientFactory httpFactory, string model, ChatMessage[] messages)
-{
-    // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
-    // TODO(student, W4)
-    var payload = JsonSerializer.Serialize(new { model, messages });
-    var status = 0;  // 0 = відповіді не було
-
-    var http = httpFactory.CreateClient();
-    try
-    {
-        var response = await http.PostAsync(
-            $"{gateway}/v1/chat/completions",
-            new StringContent(payload, Encoding.UTF8, "application/json"));
-        status = (int)response.StatusCode;
-        var rawJson = await response.Content.ReadAsStringAsync();
-
-        using var doc = JsonDocument.Parse(rawJson);
-        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
-        var answer = message.GetProperty("content").GetString() ?? "";
-
-        // tools (W3): читаємо назву і аргументи першого tool call; виконання — у /chat, спільне для hit, miss і очікування
-        string? toolCall = null, toolArgs = null;
-        if (message.TryGetProperty("tool_calls", out var tools)
-            && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
-        {
-            var function = tools[0].GetProperty("function");
-            toolCall = function.GetProperty("name").GetString();
-            toolArgs = function.TryGetProperty("arguments", out var a) && a.ValueKind == JsonValueKind.String
-                ? a.GetString() : null;
-        }
-
-        var usage = doc.RootElement.GetProperty("usage");
-        return new ModelCall(new CachedReply(answer, toolCall, toolArgs), status, true,
-            usage.GetProperty("prompt_tokens").GetInt32(), usage.GetProperty("completion_tokens").GetInt32());
-    }
-    catch
-    {
-        // мережа/gateway недоступні або відповідь не розпарсилась. без usage вартість невідома — NULL, а не 0.
-        // TODO(student, W4): тут краще graceful degradation
-        // інструмент до вибачення не виконуємо: відповіді моделі фактично немає (tool call = null)
-        return new ModelCall(new CachedReply("Сервіс тимчасово недоступний.", null, null), status, false, 0, 0);
-    }
-}
-
-app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
+app.MapPost("/chat", async (ChatIn body) =>
 {
     var requestId = Guid.NewGuid();
     var startedAt = DateTimeOffset.UtcNow;
@@ -199,7 +170,9 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // TODO(student, W4)
 
     // routing (W2): модель обираємо за задачею і бюджетом (див. Route(), OverBudget())
-    var model = Route(body.Message, defaultModel, await OverBudget());
+    // OverBudget() — запит у БД і алерт у лог, тож рахуємо раз і віддаємо і Route(), і Chain()
+    var overBudget = await OverBudget();
+    var model = Route(body.Message, defaultModel, overBudget);
 
     // промпт (W1): активну версію беремо з реєстру (таблиця prompts)
     string promptVersion, systemPrompt;
@@ -226,15 +199,21 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // перший, решта чекають його результат (single-flight, див. ResponseCache.GetOrCallAsync).
     // hit і очікування пишемо в requests з 0 токенів — власного виклику моделі в них не було.
     var cacheKey = ResponseCache.Key(model, promptVersion, messages);
-    var lookup = await responseCache.GetOrCallAsync(cacheKey, () => CallModel(httpFactory, model, messages));
-    app.Logger.LogInformation("cache {Result} for request {RequestId}: hits={Hits} misses={Misses}",
+    // fallback (W4): виклик іде ланцюжком моделей (див. ModelClient.Chain()) всередині single-flight —
+    // один прохід ланцюжка обслуговує і лідера, і всіх, хто чекав. ключ кешу — за обраною моделлю.
+    var lookup = await responseCache.GetOrCallAsync(cacheKey,
+        () => modelClient.CallAsync(ModelClient.Chain(model, defaultModel, overBudget), messages));
+    // модель, що фактично відповіла: після fallback це не та, яку обрав Route(). hit і деградація — обрана
+    // (на hit власного виклику не було, на деградації не відповіла жодна)
+    var servedModel = lookup.Call?.ServedModel ?? model;
+    app.Logger.LogInformation("cache {Result} for request {RequestId}: model {Served} (routed {Routed}), hits={Hits} misses={Misses}",
         lookup.Source switch
         {
             CacheSource.Hit => "hit",
             CacheSource.Joined => "hit (waited for an identical in-flight request)",
             CacheSource.JoinedFailed => "miss (waited for an identical in-flight request that failed)",
             _ => "miss"
-        }, requestId, responseCache.Hits, responseCache.Misses);
+        }, requestId, servedModel, model, responseCache.Hits, responseCache.Misses);
 
     var (answer, toolCall, toolArgs) = (lookup.Reply.Content, lookup.Reply.ToolName, lookup.Reply.ToolArguments);
     if (lookup.Source == CacheSource.Miss && lookup.Call is { } call)
@@ -242,8 +221,9 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         // токени й вартість пише лише той запит, що сам викликав модель
         status = call.Status;
         (promptTokens, completionTokens) = (call.PromptTokens, call.CompletionTokens);
-        // cost (W2): tokens * ціна моделі (див. CostUsd()); NULL, якщо ціни чи usage немає
-        costUsd = call.UsageParsed ? CostUsd(model, promptTokens, completionTokens) : null;
+        // cost (W2): tokens * ціна моделі, що відповіла (див. CostUsd()): відповідь mock-mid після fallback
+        // за цінами mock-strong завищила б /cost. NULL, якщо ціни чи usage немає (деградація — теж NULL)
+        costUsd = call.UsageParsed ? CostUsd(servedModel, promptTokens, completionTokens) : null;
     }
     else
     {
@@ -276,15 +256,24 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
 
-    // лог кожного запиту — з цього живе observability (W1) і cost (W2)
-    await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
+    // лог кожного запиту — з цього живе observability (W1) і cost (W2).
+    // model — та, що відповіла (W4), щоб model і cost_usd у рядку збігались
+    await LogRequest(dbConn, requestId, servedModel, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
 
     return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs });
 });
 
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
-app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));  // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
+app.MapGet("/observability", () => Results.Json(new                                              // W4: fallback_events (число, живе); W5: { p95_ms, requests, cache_hit_pct, error_rate_pct }
+{
+    todo = "aggregate from requests table",
+    // перемикання ланцюжка fallback з моменту старту процесу (лічильник у пам'яті, див. ModelClient.FallbackEvents)
+    fallback_events = modelClient.FallbackEvents,
+    // стан circuit breaker кожної моделі: closed | open | half_open (у пам'яті, див. CircuitBreaker.cs).
+    // консоль його не читає — це для перевірки й eval gate без читання логів
+    circuits = modelClient.CircuitStates()
+}));
 app.MapGet("/cost", async () =>                                                                    // W2/W5: { today_usd, budget_usd }
 {
     // сума рахується в SQL з тим самим created_at::date = CURRENT_DATE, що й у перевірці ментора,
@@ -339,7 +328,10 @@ app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest re
 app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
 app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
 
-app.Logger.LogInformation("MODEL={Model}, fallback chain: {Chain}", defaultModel, FallbackChain);
+app.Logger.LogInformation("MODEL={Model}, fallback chains: {Chains}, attempt timeout {Timeout} ms, "
+    + "circuit breaker: {Threshold} consecutive failures, probe after {Probe} s, open at most {Open} s",
+    defaultModel, ModelClient.DescribeChains(defaultModel), attemptTimeoutMs,
+    circuitOptions.FailureThreshold, circuitOptions.ProbeAfter.TotalSeconds, circuitOptions.OpenDuration.TotalSeconds);
 app.Run("http://0.0.0.0:8080");
 
 // витрати за сьогодні. COALESCE: немає рядків чи всі cost_usd NULL — це 0, а не null.
