@@ -61,6 +61,9 @@ var circuitOptions = new CircuitOptions(
         ? TimeSpan.FromSeconds(cos) : circuitDefaults.OpenDuration,
     int.TryParse(Environment.GetEnvironmentVariable("CIRCUIT_PROBE_INTERVAL_SECONDS"), out var cpi) && cpi > 0
         ? TimeSpan.FromSeconds(cpi) : circuitDefaults.ProbeInterval);
+// HITL (W4): скільки секунд заявка create_ticket чекає на підтвердження, потім — expired. за замовчуванням 900
+var approvalTtlSeconds = int.TryParse(Environment.GetEnvironmentVariable("APPROVAL_TTL_SECONDS"), out var apt) && apt > 0
+    ? apt : (int)ApprovalQueue.DefaultTtl.TotalSeconds;
 
 // один кеш, один виконавець інструментів і один клієнт моделі (з лічильником fallback) на процес
 // (див. ResponseCache.cs, Tools.cs, ModelClient.cs)
@@ -69,6 +72,8 @@ var toolRunner = new ToolRunner(new FakeOrderStore(), TimeSpan.FromMilliseconds(
 var modelClient = new ModelClient(app.Services.GetRequiredService<IHttpClientFactory>(), gateway,
     TimeSpan.FromMilliseconds(attemptTimeoutMs), app.Logger,
     circuitOptions, TimeProvider.System, ModelClient.ChainModels(defaultModel));
+// HITL (W4): черга підтверджень і фейкове сховище тікетів — у пам'яті процесу (див. Approvals.cs)
+var approvalQueue = new ApprovalQueue(new TicketStore(), TimeSpan.FromSeconds(approvalTtlSeconds), TimeProvider.System, app.Logger);
 
 // routing (W2): моделі названі за роллю, а не за провайдером — так само, як у gateway/litellm-config.yaml
 const string MiniModel = ModelClient.MiniModel;
@@ -166,13 +171,25 @@ app.MapPost("/chat", async (ChatIn body) =>
     var requestId = Guid.NewGuid();
     var startedAt = DateTimeOffset.UtcNow;
 
-    // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
-    // TODO(student, W4)
+    // guardrails (W4): спершу email → [email], потім пошук інʼєкції в замаскованому тексті (див. Guardrails.cs).
+    // далі йде лише message, не body.Message: сирий email не потрапить ні в модель, ні в кеш, ні в інструменти.
+    // інʼєкція або timeout regex — відмова без виклику моделі. у requests: model='guardrail', status='200',
+    // prompt_version, токени й cost_usd — NULL.
+    var guard = Guardrails.Inspect(body.Message);
+    if (guard.Blocked)
+    {
+        // у лог — лише причина, без тексту повідомлення
+        app.Logger.LogWarning("guardrail blocked request {RequestId}: {Reason}", requestId, guard.Reason);
+        var blockedMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
+        await LogRequest(dbConn, requestId, Guardrails.BlockedModel, null, blockedMs, null, null, null, 200);
+        return Results.Json(new { request_id = requestId, content = Guardrails.Refusal, tool = (string?)null, latency_ms = blockedMs });
+    }
+    var message = guard.Masked;
 
     // routing (W2): модель обираємо за задачею і бюджетом (див. Route(), OverBudget())
     // OverBudget() — запит у БД і алерт у лог, тож рахуємо раз і віддаємо і Route(), і Chain()
     var overBudget = await OverBudget();
-    var model = Route(body.Message, defaultModel, overBudget);
+    var model = Route(message, defaultModel, overBudget);
 
     // промпт (W1): активну версію беремо з реєстру (таблиця prompts)
     string promptVersion, systemPrompt;
@@ -189,23 +206,21 @@ app.MapPost("/chat", async (ChatIn body) =>
     }
 
     // те, що піде в модель. з цього ж масиву (разом із моделлю й версією промпта) рахується ключ кешу
-    var messages = new[] { new ChatMessage("system", systemPrompt), new ChatMessage("user", body.Message) };
-
-    int promptTokens = 0, completionTokens = 0, status;
-    decimal? costUsd;
+    var messages = new[] { new ChatMessage("system", systemPrompt), new ChatMessage("user", message) };
 
     // cache (W3): повтор того самого запиту (модель + промпт + повідомлення) після відповіді в модель не ходить —
     // його віддає кеш. однакові запити, що прийшли одночасно, теж не множать викликів: модель викликає лише
     // перший, решта чекають його результат (single-flight, див. ResponseCache.GetOrCallAsync).
-    // hit і очікування пишемо в requests з 0 токенів — власного виклику моделі в них не було.
+    // hit і очікування вдалого виклику пишемо в requests з 0 токенів — власного виклику моделі в них не було.
+    // 0/0 означає лише кеш: деградація й очікування невдалого виклику пишуть NULL-токени.
     var cacheKey = ResponseCache.Key(model, promptVersion, messages);
     // fallback (W4): виклик іде ланцюжком моделей (див. ModelClient.Chain()) всередині single-flight —
     // один прохід ланцюжка обслуговує і лідера, і всіх, хто чекав. ключ кешу — за обраною моделлю.
     var lookup = await responseCache.GetOrCallAsync(cacheKey,
         () => modelClient.CallAsync(ModelClient.Chain(model, defaultModel, overBudget), messages));
     // модель, що фактично відповіла: після fallback це не та, яку обрав Route(). hit і деградація — обрана
-    // (на hit власного виклику не було, на деградації не відповіла жодна)
-    var servedModel = lookup.Call?.ServedModel ?? model;
+    // (правило й тести — RequestRow.ServedModel)
+    var servedModel = RequestRow.ServedModel(lookup, model);
     app.Logger.LogInformation("cache {Result} for request {RequestId}: model {Served} (routed {Routed}), hits={Hits} misses={Misses}",
         lookup.Source switch
         {
@@ -216,32 +231,17 @@ app.MapPost("/chat", async (ChatIn body) =>
         }, requestId, servedModel, model, responseCache.Hits, responseCache.Misses);
 
     var (answer, toolCall, toolArgs) = (lookup.Reply.Content, lookup.Reply.ToolName, lookup.Reply.ToolArguments);
-    if (lookup.Source == CacheSource.Miss && lookup.Call is { } call)
-    {
-        // токени й вартість пише лише той запит, що сам викликав модель
-        status = call.Status;
-        (promptTokens, completionTokens) = (call.PromptTokens, call.CompletionTokens);
-        // cost (W2): tokens * ціна моделі, що відповіла (див. CostUsd()): відповідь mock-mid після fallback
-        // за цінами mock-strong завищила б /cost. NULL, якщо ціни чи usage немає (деградація — теж NULL)
-        costUsd = call.UsageParsed ? CostUsd(servedModel, promptTokens, completionTokens) : null;
-    }
-    else
-    {
-        // hit або очікування вдалого виклику (Joined): 200 і cost_usd = 0.
-        // очікування невдалого виклику (JoinedFailed, у лічильниках це miss): статус лідера і cost_usd = NULL —
-        // щоб збій у W5 не порахувався як hit. правило збою одне — ResponseCache.Succeeded().
-        status = lookup.Call?.Status ?? 200;
-        costUsd = lookup.Source == CacheSource.JoinedFailed ? null : 0m;
-    }
+    // токени, вартість і статус рядка в requests (правило NULL/0 — див. RequestRow.cs)
+    var (promptTokens, completionTokens, costUsd, status) = RequestRow.Compose(lookup, servedModel, CostUsd);
 
     // tools + HITL (W3/W4): lookup_order виконуємо (з timeout і валідацією номера, див. Tools.cs) і
     // дописуємо результат до відповіді. виконується на кожному запиті — і на hit, і на очікуванні:
     // single-flight об'єднує лише виклики моделі, не інструменти.
-    // create_ticket — незворотна дія: перед нею спитати людину.
-    // TODO(student, W4)
+    // create_ticket — незворотна дія: ToolRunner її не виконує, ми ставимо заявку в чергу HITL (див. Approvals.cs).
+    // тікет створює лише POST /approvals/{id}/approve, тож у відповіді — id заявки, а не номер тікета.
     if (toolCall != null)
     {
-        var tool = await toolRunner.RunAsync(toolCall, toolArgs, body.Message);
+        var tool = await toolRunner.RunAsync(toolCall, toolArgs, message);
         answer += tool.Suffix;
         var notChecked = tool.NotChecked > 0 ? $", {tool.NotChecked} more not checked (limit {ToolRunner.MaxOrderIds})" : "";
         if (tool.Outcome is ToolOutcome.Ok or ToolOutcome.NotFound or ToolOutcome.NotExecuted)
@@ -252,6 +252,19 @@ app.MapPost("/chat", async (ChatIn body) =>
                 toolCall, requestId, tool.Outcome, tool.Describe(), notChecked,
                 tool.Outcome == ToolOutcome.ValidationRejected ? " (validation: no valid order number in arguments or message, not executed)"
                 : tool.Outcome == ToolOutcome.Timeout ? $" (timeout {toolTimeoutMs} ms for the whole tool call)" : "");
+
+        if (toolCall == "create_ticket")
+        {
+            // дубль (той самий номер з #/№) отримує id наявної заявки; протермінована попередня — нова заявка
+            // і повідомлення, що попередню не опрацювали вчасно (див. ApprovalQueue.ReplySuffix)
+            var queued = approvalQueue.Enqueue(toolCall, guard);
+            answer += ApprovalQueue.ReplySuffix(queued);
+            // у лог — лише id і чи це дубль, без тексту повідомлення
+            app.Logger.LogInformation("approval {ApprovalId} for request {RequestId}: {Kind}",
+                queued.Approval.Id, requestId,
+                !queued.Created ? "duplicate of existing"
+                : queued.PreviousExpiredId is { } prev ? $"queued (previous {prev} expired)" : "queued");
+        }
     }
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
@@ -272,7 +285,10 @@ app.MapGet("/observability", () => Results.Json(new                             
     fallback_events = modelClient.FallbackEvents,
     // стан circuit breaker кожної моделі: closed | open | half_open (у пам'яті, див. CircuitBreaker.cs).
     // консоль його не читає — це для перевірки й eval gate без читання логів
-    circuits = modelClient.CircuitStates()
+    circuits = modelClient.CircuitStates(),
+    // HITL: скільки заявок протермінувалось без рішення з моменту старту процесу (у пам'яті, див. ApprovalQueue.ExpiredCount).
+    // консоль його не читає; кожне протермінування ще й окремий рядок у лозі
+    approvals_expired = approvalQueue.ExpiredCount
 }));
 app.MapGet("/cost", async () =>                                                                    // W2/W5: { today_usd, budget_usd }
 {
@@ -308,7 +324,7 @@ app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest re
     // activated_by — мітка, яку клієнт назвав сам, а не перевірена особа. Звідки беремо:
     // тіло { "activated_by": "..." } (браузер не пошле кирилицю в заголовку), інакше
     // заголовок X-Activated-By (для curl), інакше NULL. Довге обрізаємо до 100 символів.
-    var by = await ReadActivatedBy(req);
+    var by = await ReadLabel(req, "activated_by");
     if (by.Length == 0)
         by = req.Headers["X-Activated-By"].ToString().Trim();
     string? activatedBy = by.Length == 0 ? null : by.Length > 100 ? by[..100] : by;
@@ -326,7 +342,53 @@ app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest re
     }
 });
 app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
-app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
+// W4 (форма з уроку L08): { pending: [ { id, action, message, created_at } ],
+//   done: [ { id, action, result, approved_by, approved_at } ], rejected: [ { id, action, rejected_by, rejected_at, reason } ],
+//   expired: [ { id, action, created_at, expired_at } ] }
+// у кожному списку найновіші першими; message — замаскований текст (до 200 символів); approved_by / rejected_by /
+// reason — null, якщо не названо. консоль читає pending (id, action); done/rejected/expired — для перевірки й аудиту
+app.MapGet("/approvals", () => Results.Json(approvalQueue.List()));
+// W4: 200 { id, status: "done", result: "TCK-…", approved_by, approved_at };
+// 404 { error } — немає такої заявки, вже оброблена, ще обробляється або протермінована (нічого не змінюється);
+// 503 { error } — тікет не створився, заявка знову pending
+app.MapPost("/approvals/{id}/approve", async (string id, HttpRequest req) =>
+{
+    // approved_by — мітка, яку назвав клієнт, як activated_by в активації промпта: тіло { "approved_by": "..." },
+    // інакше заголовок X-Approved-By, інакше NULL
+    var by = DecisionLabel((await ReadLabels(req, "approved_by"))[0], req.Headers["X-Approved-By"]);
+    DoneApproval? done;
+    try
+    {
+        done = approvalQueue.Approve(id, by);
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogError(ex, "approval {ApprovalId} by {By}: ticket store failed, approval is pending again", id, by ?? "-");
+        return Results.Json(new { error = "ticket store unavailable, approval is pending again" }, statusCode: 503);
+    }
+    if (done == null)
+        return Results.Json(new { error = "approval not found or already done" }, statusCode: 404);
+    // у лог — id заявки й тікета та хто підтвердив, без тексту заявки
+    app.Logger.LogInformation("approval {ApprovalId} approved by {By}: ticket {Ticket}", done.Id, done.ApprovedBy ?? "-", done.Result);
+    return Results.Json(new { id = done.Id, status = "done", result = done.Result,
+        approved_by = done.ApprovedBy, approved_at = done.ApprovedAt });
+});
+// W4: 200 { id, status: "rejected", rejected_by, rejected_at, reason }; той самий 404, що й в approve.
+// тіло { "rejected_by": "...", "reason": "..." } (обидва необовʼязкові), інакше заголовок X-Rejected-By.
+// інструмент не виконується; відхилена заявка звільняє номер замовлення для нової заявки
+app.MapPost("/approvals/{id}/reject", async (string id, HttpRequest req) =>
+{
+    var labels = await ReadLabels(req, "rejected_by", "reason");
+    var by = DecisionLabel(labels[0], req.Headers["X-Rejected-By"]);
+    string? reason = labels[1].Length == 0 ? null : ApprovalQueue.Clip(labels[1], ApprovalQueue.MaxReasonChars);
+    var rejected = approvalQueue.Reject(id, by, reason);
+    if (rejected == null)
+        return Results.Json(new { error = "approval not found or already done" }, statusCode: 404);
+    // причину в лог не пишемо: це вільний текст оператора
+    app.Logger.LogInformation("approval {ApprovalId} rejected by {By}", rejected.Id, rejected.RejectedBy ?? "-");
+    return Results.Json(new { id = rejected.Id, status = "rejected", rejected_by = rejected.RejectedBy,
+        rejected_at = rejected.RejectedAt, reason = rejected.Reason });
+});
 
 app.Logger.LogInformation("MODEL={Model}, fallback chains: {Chains}, attempt timeout {Timeout} ms, "
     + "circuit breaker: {Threshold} consecutive failures, probe after {Probe} s, open at most {Open} s",
@@ -401,27 +463,40 @@ static async Task<List<PromptOut>> ListPrompts(string conn)
     return list;
 }
 
-// дістає activated_by з необовʼязкового JSON-тіла. порожнє тіло, {}, не-JSON, не той
-// Content-Type чи не рядок — це "імені немає" (""), а не 400: кнопка без імені шле {}.
-static async Task<string> ReadActivatedBy(HttpRequest req)
+static async Task<string> ReadLabel(HttpRequest req, string field) => (await ReadLabels(req, field))[0];
+
+// дістає рядкові поля (activated_by, approved_by, rejected_by, reason) з необовʼязкового JSON-тіла — за одне
+// читання потоку. порожнє тіло, {}, не-JSON, не той Content-Type чи не рядок — це "значення немає" (""),
+// а не 400: кнопка без імені шле {}.
+static async Task<string[]> ReadLabels(HttpRequest req, params string[] fields)
 {
+    var values = fields.Select(_ => "").ToArray();
     try
     {
         using var sr = new StreamReader(req.Body, Encoding.UTF8, leaveOpen: true);  // потік тіла належить Kestrel
         var raw = await sr.ReadToEndAsync();
         if (string.IsNullOrWhiteSpace(raw))
-            return "";
+            return values;
         using var doc = JsonDocument.Parse(raw);
-        return doc.RootElement.ValueKind == JsonValueKind.Object
-            && doc.RootElement.TryGetProperty("activated_by", out var v)
-            && v.ValueKind == JsonValueKind.String
-            ? (v.GetString() ?? "").Trim()
-            : "";
+        if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            return values;
+        for (var i = 0; i < fields.Length; i++)
+            if (doc.RootElement.TryGetProperty(fields[i], out var v) && v.ValueKind == JsonValueKind.String)
+                values[i] = (v.GetString() ?? "").Trim();
+        return values;
     }
     catch (JsonException)
     {
-        return "";
+        return values;
     }
+}
+
+// хто ухвалив рішення по заявці: з тіла, інакше із заголовка (для curl), інакше NULL.
+// довге обрізаємо до 100 символів, не розриваючи емодзі
+static string? DecisionLabel(string fromBody, string? header)
+{
+    var by = fromBody.Length > 0 ? fromBody : (header ?? "").Trim();
+    return by.Length == 0 ? null : ApprovalQueue.Clip(by, ApprovalQueue.MaxLabelChars);
 }
 
 // перемикає активну версію і пише подію в журнал активацій — в ОДНІЙ транзакції,
@@ -454,8 +529,10 @@ static async Task<int> ActivatePrompt(string conn, string version, string? activ
 }
 
 // пише один рядок у requests. якщо лог впав — запит користувача все одно віддаємо.
-static async Task LogRequest(string conn, Guid id, string model, string promptVersion, int latency,
-    int promptTokens, int completionTokens, decimal? cost, int status)
+// NULL у prompt_version і токенах — у заблокованого guardrails запиту (до реєстру промптів і моделі він не дійшов).
+// NULL лише в токенах — на деградації та на очікуванні невдалого виклику (usage немає); 0 токенів — тільки hit кешу
+static async Task LogRequest(string conn, Guid id, string model, string? promptVersion, int latency,
+    int? promptTokens, int? completionTokens, decimal? cost, int status)
 {
     try
     {
@@ -466,12 +543,12 @@ static async Task LogRequest(string conn, Guid id, string model, string promptVe
             + "VALUES (@id, @model, @pv, @lat, @pt, @ct, @cost, @status)", db);
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("model", model);
-        cmd.Parameters.AddWithValue("pv", promptVersion);
+        cmd.Parameters.AddWithValue("pv", (object?)promptVersion ?? DBNull.Value);
         cmd.Parameters.AddWithValue("lat", latency);
-        cmd.Parameters.AddWithValue("pt", promptTokens);
-        cmd.Parameters.AddWithValue("ct", completionTokens);
+        cmd.Parameters.AddWithValue("pt", (object?)promptTokens ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("ct", (object?)completionTokens ?? DBNull.Value);
         cmd.Parameters.AddWithValue("cost", (object?)cost ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("status", status.ToString());
+        cmd.Parameters.AddWithValue("status", status.ToString(CultureInfo.InvariantCulture));
         await cmd.ExecuteNonQueryAsync();
     }
     catch { /* не валимо запит через лог */ }

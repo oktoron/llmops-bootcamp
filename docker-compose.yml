@@ -15,6 +15,7 @@ services:
       - BUDGET_USD=${BUDGET_USD:-5}   # денний бюджет у USD: GET /cost і budget-політика (з 80% — деградація на mock-mini)
       - CACHE_TTL_SECONDS=${CACHE_TTL_SECONDS:-600}   # скільки секунд живе закешована відповідь (W3)
       - TOOL_TIMEOUT_MS=${TOOL_TIMEOUT_MS:-2000}   # бюджет часу на один виклик інструмента, мс (W3)
+      - APPROVAL_TTL_SECONDS=${APPROVAL_TTL_SECONDS:-900}   # скільки секунд заявка HITL чекає на approve, потім expired (W4)
     depends_on: [gateway, postgres]
 
   gateway:

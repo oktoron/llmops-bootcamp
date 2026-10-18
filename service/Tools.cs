@@ -136,6 +136,28 @@ public sealed class ToolRunner
         return new OrderIds(ids, Math.Max(0, seen.Count - MaxOrderIds));
     }
 
+    // «№» — номер замовлення лише після «замовлення / order»: інакше це «відділення №12» Нової пошти
+    private static readonly Regex OrderNumeroPattern = new(
+        @"\b(?:замовлен\w*|orders?)\s*№\s*(?<digits>\d+)(?![\d\p{L}\p{M}])",
+        RegexOptions.Compiled | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    // номери для ключа дедуплікації HITL, без повторів, відсортовані: «#123» (або «＃123») і «замовлення №123».
+    // голе число тут не вгадуємо: для незворотної дії помилка дорожча за «не знайдено» — «чекаю 3 дні» і
+    // «посилка йшла 3 тижні» від різних клієнтів злилися б в одну заявку. «№» без «замовлення» теж не номер:
+    // «у відділенні №12» від двох клієнтів злило б їхні заявки (для lookup_order «№12» лишається номером)
+    public static IReadOnlyList<string> MarkedOrderIds(string? text)
+    {
+        var ids = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (Match m in NumberPattern.Matches(text ?? ""))
+            if (m.Groups["marker"].Success && m.Groups["marker"].Value[0] != '№'
+                && NormalizeOrderId(m.Groups["digits"].Value) is { } id)
+                ids.Add(id);
+        foreach (Match m in OrderNumeroPattern.Matches(text ?? ""))
+            if (NormalizeOrderId(m.Groups["digits"].Value) is { } id)
+                ids.Add(id);
+        return ids.ToList();
+    }
+
     private static string? RawOrderIdFromArguments(string? argumentsJson)
     {
         if (string.IsNullOrWhiteSpace(argumentsJson))
