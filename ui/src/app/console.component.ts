@@ -1,6 +1,6 @@
 import { Component, ElementRef, OnDestroy, OnInit, ViewChild } from '@angular/core';
 import { CommonModule } from '@angular/common';
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpErrorResponse } from '@angular/common/http';
 import { of } from 'rxjs';
 import { catchError } from 'rxjs/operators';
 
@@ -12,6 +12,21 @@ interface PromptRow {
   activated_by: string | null;
   created_at: string;
   activated_at: string | null;  // null — версію ще жодного разу не активували
+}
+
+// рядок GET /approvals → pending[] (контракт уроку L08: { pending: [ { id, action } ] }).
+// message і created_at сервіс теж віддає, але картка працює й без них
+interface ApprovalRow {
+  id: string;
+  action: string;
+  message?: string;  // уже замаскований сервісом текст заявки
+  created_at?: string;
+}
+
+// що робимо в попапі: активація версії промпта / approve «від імені» або reject заявки HITL
+interface PendingAct {
+  kind: 'activate' | 'approve' | 'reject';
+  target: string;  // версія промпта або id заявки
 }
 
 @Component({
@@ -78,15 +93,20 @@ interface PromptRow {
     </div>
 
     <!-- попап поза *ngFor: опитування кожні 4с перемальовує рядки, а тут введене не зітреться -->
-    <div class="modal-bg" *ngIf="pendingVersion" (click)="cancelActivate()">
+    <div class="modal-bg" *ngIf="pendingAct" (click)="cancelActivate()">
       <div class="modal" (click)="$event.stopPropagation()">
-        <div class="mh">Активувати <span class="mono">{{ pendingVersion }}</span> від імені</div>
-        <input #nameInput class="name-in" type="text" maxlength="100" placeholder="імʼя"
+        <div class="mh">{{ actTitle(pendingAct) }} <span class="mono">{{ pendingAct.target }}</span>{{ pendingAct.kind === 'reject' ? '' : ' від імені' }}</div>
+        <input #nameInput class="name-in" type="text" maxlength="100"
+               [placeholder]="pendingAct.kind === 'reject' ? 'імʼя (необовʼязково)' : 'імʼя'"
                [value]="pendingName" (input)="pendingName = nameInput.value"
+               (keydown.enter)="confirmActivate()" (keydown.escape)="cancelActivate()" />
+        <!-- reject: причина необовʼязкова, сервіс зберігає її разом з автором і часом -->
+        <input *ngIf="pendingAct.kind === 'reject'" class="name-in gap" type="text" maxlength="200" placeholder="причина (необовʼязково)"
+               [value]="pendingReason" (input)="pendingReason = $any($event.target).value"
                (keydown.enter)="confirmActivate()" (keydown.escape)="cancelActivate()" />
         <div class="modal-actions">
           <button class="act" (click)="cancelActivate()">скасувати</button>
-          <button class="act ok" [disabled]="!pendingName.trim()" (click)="confirmActivate()">активувати</button>
+          <button class="act ok" [disabled]="pendingAct.kind !== 'reject' && !pendingName.trim()" (click)="confirmActivate()">{{ actButton(pendingAct) }}</button>
         </div>
       </div>
     </div>
@@ -101,16 +121,25 @@ interface PromptRow {
 
     <div class="card">
       <div class="ch">Approvals · HITL <span class="lens">L08</span></div>
+      <!-- результат останньої дії: номер тікета, «вже оброблено або прострочено» (404) чи «відхилено» -->
+      <div class="notice" *ngIf="notice">{{ notice }}</div>
+      <!-- лише pending: done / rejected / expired сервіс теж віддає, але дії над ними немає -->
       <ng-container *ngIf="approvals?.length; else emptyA">
-        <div class="row" *ngFor="let a of approvals">
+        <div class="row" *ngFor="let a of approvals; trackBy: trackApproval">
           <span class="mono">{{ a.id }}</span> {{ a.action }}
-          <button class="act ok" (click)="approve(a.id)">approve</button>
+          <span class="by trunc wide" *ngIf="a.message" [attr.title]="a.message">{{ a.message }}</span>
+          <div class="acts push">
+            <!-- поки запит по цій заявці в дорозі, кнопки вимкнено: подвійний клік не дасть другого POST, і пізній 404 не затре номер тікета -->
+            <button class="act ok" [disabled]="inFlight.has(a.id)" (click)="approve(a.id)">approve</button>
+            <button class="act ok" [disabled]="inFlight.has(a.id)" (click)="askApproveName(a.id)">approve від імені</button>
+            <button class="act no" [disabled]="inFlight.has(a.id)" (click)="askReject(a.id)">reject</button>
+          </div>
         </div>
       </ng-container>
       <ng-template #emptyA><div class="empty">— черга порожня</div></ng-template>
     </div>
 
-    <p class="foot">Read-only вітрина + дії approve/rollback. Дані з API сервісу; «—» означає, що ендпоінт ще заглушка — реалізуй його, і плитка оживе.</p>
+    <p class="foot">Read-only вітрина + дії approve/reject/rollback. Дані з API сервісу; «—» означає, що ендпоінт ще заглушка — реалізуй його, і плитка оживе.</p>
   `,
   styles: [
     `
@@ -138,6 +167,9 @@ interface PromptRow {
       .act { margin-left: auto; font-size: 11.5px; border: 1px solid #dfe1e8; background: #fff; border-radius: 7px; padding: 3px 10px; cursor: pointer; color: #565c6b; font-family: inherit; }
       .act:hover { border-color: #4038c4; color: #4038c4; }
       .act.ok:hover { border-color: #177245; color: #177245; }
+      .act.no:hover { border-color: #b3261e; color: #b3261e; }
+      .notice { font-size: 12.5px; color: #565c6b; background: #f4f5f8; border-radius: 7px; padding: 6px 9px; margin-bottom: 8px; }
+      .name-in.gap { margin-top: 8px; }
       .act + .act { margin-left: 0; }
       .act:disabled { opacity: 0.5; cursor: default; border-color: #dfe1e8; color: #565c6b; }
       .by { font-size: 12px; color: #8a90a0; }
@@ -155,6 +187,8 @@ interface PromptRow {
       .trunc { display: inline-block; max-width: 16ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; }
       .acts { display: flex; gap: 6px; }
       .acts .act { margin-left: 0; }
+      .acts.push { margin-left: auto; }
+      .trunc.wide { max-width: 40ch; }
       .mh { font-weight: 650; font-size: 14px; margin-bottom: 10px; }
       .modal-bg { position: fixed; inset: 0; background: rgba(20,20,30,.25); display: flex; align-items: center; justify-content: center; z-index: 10; }
       .modal { background: #fff; border: 1px solid #e4e6ec; border-radius: 12px; padding: 14px; width: 320px; box-shadow: 0 8px 24px rgba(20,20,30,.12); }
@@ -176,9 +210,12 @@ export class ConsoleComponent implements OnInit, OnDestroy {
   cost: any = null;
   prompts: PromptRow[] | null = null;
   providers: any[] | null = null;
-  approvals: any[] | null = null;
-  pendingVersion: string | null = null;  // версія, для якої відкрито попап «від імені»
+  approvals: ApprovalRow[] | null = null;
+  pendingAct: PendingAct | null = null;  // для чого відкрито попап
   pendingName = '';
+  pendingReason = '';
+  notice: string | null = null;  // результат останнього approve / reject
+  inFlight = new Set<string>();  // id заявок, по яких approve / reject ще не отримав відповіді
   private timer: ReturnType<typeof setInterval> | null = null;
 
   // фокус у поле, щойно попап зʼявився (атрибут autofocus на динамічних елементах ненадійний)
@@ -206,11 +243,50 @@ export class ConsoleComponent implements OnInit, OnDestroy {
     get('/api/approvals').subscribe((d) => (this.approvals = d?.pending ?? null));
   }
 
-  approve(id: string): void {
-    this.http.post('/api/approvals/' + id + '/approve', {}).subscribe({
-      next: () => this.refresh(),
-      error: () => this.refresh(),
+  // імʼя — у тілі, як і в активації промпта; без імені — {}. id від сервісу URL-безпечний, але кодуємо про всяк випадок.
+  // 200 і 404 оператор має розрізняти: на успіх — номер тікета, на 404 — що заявку вже обробили або вона прострочена
+  approve(id: string, by?: string): void {
+    if (this.inFlight.has(id)) return;  // другий клік, поки перший у дорозі
+    this.inFlight.add(id);
+    this.http.post<any>('/api/approvals/' + encodeURIComponent(id) + '/approve', by ? { approved_by: by } : {}).subscribe({
+      next: (r) => {
+        this.inFlight.delete(id);
+        this.notice = `Заявку ${id} підтверджено, тікет ${r?.result ?? '—'}`;
+        this.refresh();
+      },
+      error: (e: HttpErrorResponse) => {
+        this.inFlight.delete(id);
+        this.notice = this.decisionError(id, e);
+        this.refresh();
+      },
     });
+  }
+
+  reject(id: string, by?: string, reason?: string): void {
+    if (this.inFlight.has(id)) return;
+    this.inFlight.add(id);
+    const body: Record<string, string> = {};
+    if (by) body['rejected_by'] = by;
+    if (reason) body['reason'] = reason;
+    this.http.post('/api/approvals/' + encodeURIComponent(id) + '/reject', body).subscribe({
+      next: () => {
+        this.inFlight.delete(id);
+        this.notice = `Заявку ${id} відхилено`;
+        this.refresh();
+      },
+      error: (e: HttpErrorResponse) => {
+        this.inFlight.delete(id);
+        this.notice = this.decisionError(id, e);
+        this.refresh();
+      },
+    });
+  }
+
+  // 404 — той самий для «вже оброблено», «прострочено» і «немає такої»: сервіс навмисно їх не розрізняє
+  private decisionError(id: string, e: HttpErrorResponse): string {
+    return e.status === 404
+      ? `Заявку ${id} вже оброблено або прострочено`
+      : `Заявку ${id} не оброблено: помилка сервісу (${e.status || 'немає звʼязку'}), заявка чекає далі`;
   }
 
   // імʼя йде в тілі, а не в X-Activated-By: браузер не пускає кирилицю в заголовки
@@ -222,22 +298,51 @@ export class ConsoleComponent implements OnInit, OnDestroy {
   }
 
   askName(version: string): void {
-    this.pendingVersion = version;
+    this.pendingAct = { kind: 'activate', target: version };
     this.pendingName = '';
   }
 
-  // порожнє імʼя не шлемо: для активації без імені є звичайна кнопка
+  askApproveName(id: string): void {
+    this.pendingAct = { kind: 'approve', target: id };
+    this.pendingName = '';
+  }
+
+  askReject(id: string): void {
+    this.pendingAct = { kind: 'reject', target: id };
+    this.pendingName = '';
+    this.pendingReason = '';
+  }
+
+  actTitle(act: PendingAct): string {
+    return act.kind === 'reject' ? 'Відхилити' : act.kind === 'approve' ? 'Підтвердити' : 'Активувати';
+  }
+
+  actButton(act: PendingAct): string {
+    return act.kind === 'reject' ? 'reject' : act.kind === 'approve' ? 'approve' : 'активувати';
+  }
+
+  // approve/активація «від імені» без імені не шлемо: для дії без імені є звичайна кнопка.
+  // reject — імʼя і причина необовʼязкові
   confirmActivate(): void {
     const name = this.pendingName.trim();
-    if (!this.pendingVersion || !name) return;
-    this.activate(this.pendingVersion, name);
+    const act = this.pendingAct;
+    if (!act) return;
+    if (act.kind === 'reject') this.reject(act.target, name, this.pendingReason.trim());
+    else if (!name) return;
+    else if (act.kind === 'approve') this.approve(act.target, name);
+    else this.activate(act.target, name);
     this.cancelActivate();
   }
 
   // скасування нічого не надсилає
   cancelActivate(): void {
-    this.pendingVersion = null;
+    this.pendingAct = null;
     this.pendingName = '';
+    this.pendingReason = '';
+  }
+
+  trackApproval(_: number, a: ApprovalRow): string {
+    return a.id;
   }
 
   // ключ рядка: без нього опитування кожні 4с перестворює <tr> — гаснуть підказки title, губляться кліки

@@ -47,24 +47,47 @@ var budgetUsd = decimal.TryParse(Environment.GetEnvironmentVariable("BUDGET_USD"
 var cacheTtlSeconds = int.TryParse(Environment.GetEnvironmentVariable("CACHE_TTL_SECONDS"), out var ttl) && ttl > 0 ? ttl : 600;
 // tools (W3): бюджет часу на один виклик інструмента — спільний для всіх номерів у ньому (до 3), а не на кожен. без TOOL_TIMEOUT_MS (або з нулем/сміттям) — 2000 мс
 var toolTimeoutMs = int.TryParse(Environment.GetEnvironmentVariable("TOOL_TIMEOUT_MS"), out var tt) && tt > 0 ? tt : 2000;
+// fallback (W4): бюджет часу на одну спробу моделі; минув — перемикаємось на наступну. без MODEL_ATTEMPT_TIMEOUT_MS (або з нулем/сміттям) — 30000 мс
+var attemptTimeoutMs = int.TryParse(Environment.GetEnvironmentVariable("MODEL_ATTEMPT_TIMEOUT_MS"), out var at) && at > 0
+    ? at : (int)ModelClient.DefaultAttemptTimeout.TotalMilliseconds;
+// circuit breaker (W4, опційно): скільки збоїв поспіль відкривають модель, верхня межа «відкритості» і як часто
+// пускати пробний запит. без CIRCUIT_FAILURE_THRESHOLD / CIRCUIT_OPEN_SECONDS / CIRCUIT_PROBE_INTERVAL_SECONDS
+// (або з нулем/сміттям) — 3 збої, 30 с, 5 с
+var circuitDefaults = CircuitOptions.Default;
+var circuitOptions = new CircuitOptions(
+    int.TryParse(Environment.GetEnvironmentVariable("CIRCUIT_FAILURE_THRESHOLD"), out var cft) && cft > 0
+        ? cft : circuitDefaults.FailureThreshold,
+    int.TryParse(Environment.GetEnvironmentVariable("CIRCUIT_OPEN_SECONDS"), out var cos) && cos > 0
+        ? TimeSpan.FromSeconds(cos) : circuitDefaults.OpenDuration,
+    int.TryParse(Environment.GetEnvironmentVariable("CIRCUIT_PROBE_INTERVAL_SECONDS"), out var cpi) && cpi > 0
+        ? TimeSpan.FromSeconds(cpi) : circuitDefaults.ProbeInterval);
+// HITL (W4): скільки секунд заявка create_ticket чекає на підтвердження, потім — expired. за замовчуванням 900
+var approvalTtlSeconds = int.TryParse(Environment.GetEnvironmentVariable("APPROVAL_TTL_SECONDS"), out var apt) && apt > 0
+    ? apt : (int)ApprovalQueue.DefaultTtl.TotalSeconds;
 
-// один кеш і один виконавець інструментів на процес (див. ResponseCache.cs, Tools.cs)
+// один кеш, один виконавець інструментів і один клієнт моделі (з лічильником fallback) на процес
+// (див. ResponseCache.cs, Tools.cs, ModelClient.cs)
 var responseCache = new ResponseCache(TimeSpan.FromSeconds(cacheTtlSeconds));
 var toolRunner = new ToolRunner(new FakeOrderStore(), TimeSpan.FromMilliseconds(toolTimeoutMs));
+var modelClient = new ModelClient(app.Services.GetRequiredService<IHttpClientFactory>(), gateway,
+    TimeSpan.FromMilliseconds(attemptTimeoutMs), app.Logger,
+    circuitOptions, TimeProvider.System, ModelClient.ChainModels(defaultModel));
+// HITL (W4): черга підтверджень і фейкове сховище тікетів — у пам'яті процесу (див. Approvals.cs)
+var approvalQueue = new ApprovalQueue(new TicketStore(), TimeSpan.FromSeconds(approvalTtlSeconds), TimeProvider.System, app.Logger);
 
 // routing (W2): моделі названі за роллю, а не за провайдером — так само, як у gateway/litellm-config.yaml
-const string MiniModel = "mock-mini";
-const string StrongModel = "mock-strong";
+const string MiniModel = ModelClient.MiniModel;
+const string StrongModel = ModelClient.StrongModel;
 // третій маршрут (W2, опційно): середній tier для питань про замовлення й доставку —
 // там модель має впевнено викликати інструмент, але це ще не ескалація
-const string MidModel = "mock-mid";
+const string MidModel = ModelClient.MidModel;
 
-// fallback chain: mock-strong -> mock-mid -> mock-mini -> контрольована помилка. Поки це лише рядок — на W4 він стане кодом.
-// кожен tier падає на наступний дешевший; mock-mid стартує з другого кроку, mock-mini — з третього.
-// mock-mini і mock-mid живуть на тому ж провайдері, що й mock-strong, тож падіння провайдера цей ланцюжок не переживе.
-// Провайдер з іншим ключем (gemini — закоментований блок у gateway/litellm-config.yaml) стає
-// другим кроком: mock-strong -> gemini -> mock-mid -> mock-mini -> контрольована помилка.
-const string FallbackChain = "mock-strong -> mock-mid -> mock-mini -> контрольована помилка";
+// fallback chain (W4): для кожного tier свій ланцюжок — ModelClient.Chain():
+// mock-strong -> mock-mid -> mock-mini, mock-mid -> mock-mini, mock-mini -> mock-mid, далі — DegradedReply.
+// понад бюджет mock-mini — без кроку на дорожчу mock-mid: mock-mini -> DegradedReply.
+// перемикаємось лише на 0 (немає відповіді/timeout), 429, 5xx і 200, що не розпарсився; на 4xx — ні.
+// circuit breaker (див. CircuitBreaker.cs): модель після кількох таких збоїв поспіль відкрита — її пропускаємо без виклику,
+// доки не вдасться пробний запит. усі моделі ланцюжка відкриті — одразу DegradedReply зі статусом 503.
 
 // budget-політика (W2, опційно): з 80% денного бюджету (BUDGET_USD) — алерт у лог і деградація на mock-mini
 const decimal BudgetAlertShare = 0.8m;
@@ -72,6 +95,7 @@ const decimal BudgetAlertShare = 0.8m;
 // обирає модель за задачею. Порядок: реальна модель із MODEL -> бюджет -> ескалація -> замовлення -> решта.
 // Реальну модель із MODEL не чіпаємо: її обрав власник конфігурації.
 // понад поріг бюджету все йде на найдешевшу mock-mini — навіть ескалації: бюджет важливіший за tier.
+// fallback теж лишається на mini: понад бюджет ModelClient.Chain() не переходить на дорожчу mock-mid.
 // ескалації (повернення грошей, терміново, скарги) — на mock-strong; замовлення/доставка — на mock-mid;
 // решта — на дешеву mock-mini. Ескалація перемагає замовлення: «поверніть гроші за замовлення» — це mock-strong.
 static string Route(string message, string defaultModel, bool overBudget)
@@ -142,64 +166,30 @@ async Task<bool> OverBudget()
     }
 }
 
-// один виклик моделі через gateway — фабрика для single-flight у ResponseCache.GetOrCallAsync.
-// ніколи не кидає: збій — це вибачення з UsageParsed = false (status лишиться 0/5xx).
-// без RequestAborted свідомо: результат можуть чекати інші запити, і відключення одного клієнта
-// не має скасувати спільний виклик.
-async Task<ModelCall> CallModel(IHttpClientFactory httpFactory, string model, ChatMessage[] messages)
-{
-    // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
-    // TODO(student, W4)
-    var payload = JsonSerializer.Serialize(new { model, messages });
-    var status = 0;  // 0 = відповіді не було
-
-    var http = httpFactory.CreateClient();
-    try
-    {
-        var response = await http.PostAsync(
-            $"{gateway}/v1/chat/completions",
-            new StringContent(payload, Encoding.UTF8, "application/json"));
-        status = (int)response.StatusCode;
-        var rawJson = await response.Content.ReadAsStringAsync();
-
-        using var doc = JsonDocument.Parse(rawJson);
-        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
-        var answer = message.GetProperty("content").GetString() ?? "";
-
-        // tools (W3): читаємо назву і аргументи першого tool call; виконання — у /chat, спільне для hit, miss і очікування
-        string? toolCall = null, toolArgs = null;
-        if (message.TryGetProperty("tool_calls", out var tools)
-            && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
-        {
-            var function = tools[0].GetProperty("function");
-            toolCall = function.GetProperty("name").GetString();
-            toolArgs = function.TryGetProperty("arguments", out var a) && a.ValueKind == JsonValueKind.String
-                ? a.GetString() : null;
-        }
-
-        var usage = doc.RootElement.GetProperty("usage");
-        return new ModelCall(new CachedReply(answer, toolCall, toolArgs), status, true,
-            usage.GetProperty("prompt_tokens").GetInt32(), usage.GetProperty("completion_tokens").GetInt32());
-    }
-    catch
-    {
-        // мережа/gateway недоступні або відповідь не розпарсилась. без usage вартість невідома — NULL, а не 0.
-        // TODO(student, W4): тут краще graceful degradation
-        // інструмент до вибачення не виконуємо: відповіді моделі фактично немає (tool call = null)
-        return new ModelCall(new CachedReply("Сервіс тимчасово недоступний.", null, null), status, false, 0, 0);
-    }
-}
-
-app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
+app.MapPost("/chat", async (ChatIn body) =>
 {
     var requestId = Guid.NewGuid();
     var startedAt = DateTimeOffset.UtcNow;
 
-    // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
-    // TODO(student, W4)
+    // guardrails (W4): спершу email → [email], потім пошук інʼєкції в замаскованому тексті (див. Guardrails.cs).
+    // далі йде лише message, не body.Message: сирий email не потрапить ні в модель, ні в кеш, ні в інструменти.
+    // інʼєкція або timeout regex — відмова без виклику моделі. у requests: model='guardrail', status='200',
+    // prompt_version, токени й cost_usd — NULL.
+    var guard = Guardrails.Inspect(body.Message);
+    if (guard.Blocked)
+    {
+        // у лог — лише причина, без тексту повідомлення
+        app.Logger.LogWarning("guardrail blocked request {RequestId}: {Reason}", requestId, guard.Reason);
+        var blockedMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
+        await LogRequest(dbConn, requestId, Guardrails.BlockedModel, null, blockedMs, null, null, null, 200);
+        return Results.Json(new { request_id = requestId, content = Guardrails.Refusal, tool = (string?)null, latency_ms = blockedMs });
+    }
+    var message = guard.Masked;
 
     // routing (W2): модель обираємо за задачею і бюджетом (див. Route(), OverBudget())
-    var model = Route(body.Message, defaultModel, await OverBudget());
+    // OverBudget() — запит у БД і алерт у лог, тож рахуємо раз і віддаємо і Route(), і Chain()
+    var overBudget = await OverBudget();
+    var model = Route(message, defaultModel, overBudget);
 
     // промпт (W1): активну версію беремо з реєстру (таблиця prompts)
     string promptVersion, systemPrompt;
@@ -216,52 +206,42 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     }
 
     // те, що піде в модель. з цього ж масиву (разом із моделлю й версією промпта) рахується ключ кешу
-    var messages = new[] { new ChatMessage("system", systemPrompt), new ChatMessage("user", body.Message) };
-
-    int promptTokens = 0, completionTokens = 0, status;
-    decimal? costUsd;
+    var messages = new[] { new ChatMessage("system", systemPrompt), new ChatMessage("user", message) };
 
     // cache (W3): повтор того самого запиту (модель + промпт + повідомлення) після відповіді в модель не ходить —
     // його віддає кеш. однакові запити, що прийшли одночасно, теж не множать викликів: модель викликає лише
     // перший, решта чекають його результат (single-flight, див. ResponseCache.GetOrCallAsync).
-    // hit і очікування пишемо в requests з 0 токенів — власного виклику моделі в них не було.
+    // hit і очікування вдалого виклику пишемо в requests з 0 токенів — власного виклику моделі в них не було.
+    // 0/0 означає лише кеш: деградація й очікування невдалого виклику пишуть NULL-токени.
     var cacheKey = ResponseCache.Key(model, promptVersion, messages);
-    var lookup = await responseCache.GetOrCallAsync(cacheKey, () => CallModel(httpFactory, model, messages));
-    app.Logger.LogInformation("cache {Result} for request {RequestId}: hits={Hits} misses={Misses}",
+    // fallback (W4): виклик іде ланцюжком моделей (див. ModelClient.Chain()) всередині single-flight —
+    // один прохід ланцюжка обслуговує і лідера, і всіх, хто чекав. ключ кешу — за обраною моделлю.
+    var lookup = await responseCache.GetOrCallAsync(cacheKey,
+        () => modelClient.CallAsync(ModelClient.Chain(model, defaultModel, overBudget), messages));
+    // модель, що фактично відповіла: після fallback це не та, яку обрав Route(). hit і деградація — обрана
+    // (правило й тести — RequestRow.ServedModel)
+    var servedModel = RequestRow.ServedModel(lookup, model);
+    app.Logger.LogInformation("cache {Result} for request {RequestId}: model {Served} (routed {Routed}), hits={Hits} misses={Misses}",
         lookup.Source switch
         {
             CacheSource.Hit => "hit",
             CacheSource.Joined => "hit (waited for an identical in-flight request)",
             CacheSource.JoinedFailed => "miss (waited for an identical in-flight request that failed)",
             _ => "miss"
-        }, requestId, responseCache.Hits, responseCache.Misses);
+        }, requestId, servedModel, model, responseCache.Hits, responseCache.Misses);
 
     var (answer, toolCall, toolArgs) = (lookup.Reply.Content, lookup.Reply.ToolName, lookup.Reply.ToolArguments);
-    if (lookup.Source == CacheSource.Miss && lookup.Call is { } call)
-    {
-        // токени й вартість пише лише той запит, що сам викликав модель
-        status = call.Status;
-        (promptTokens, completionTokens) = (call.PromptTokens, call.CompletionTokens);
-        // cost (W2): tokens * ціна моделі (див. CostUsd()); NULL, якщо ціни чи usage немає
-        costUsd = call.UsageParsed ? CostUsd(model, promptTokens, completionTokens) : null;
-    }
-    else
-    {
-        // hit або очікування вдалого виклику (Joined): 200 і cost_usd = 0.
-        // очікування невдалого виклику (JoinedFailed, у лічильниках це miss): статус лідера і cost_usd = NULL —
-        // щоб збій у W5 не порахувався як hit. правило збою одне — ResponseCache.Succeeded().
-        status = lookup.Call?.Status ?? 200;
-        costUsd = lookup.Source == CacheSource.JoinedFailed ? null : 0m;
-    }
+    // токени, вартість і статус рядка в requests (правило NULL/0 — див. RequestRow.cs)
+    var (promptTokens, completionTokens, costUsd, status) = RequestRow.Compose(lookup, servedModel, CostUsd);
 
     // tools + HITL (W3/W4): lookup_order виконуємо (з timeout і валідацією номера, див. Tools.cs) і
     // дописуємо результат до відповіді. виконується на кожному запиті — і на hit, і на очікуванні:
     // single-flight об'єднує лише виклики моделі, не інструменти.
-    // create_ticket — незворотна дія: перед нею спитати людину.
-    // TODO(student, W4)
+    // create_ticket — незворотна дія: ToolRunner її не виконує, ми ставимо заявку в чергу HITL (див. Approvals.cs).
+    // тікет створює лише POST /approvals/{id}/approve, тож у відповіді — id заявки, а не номер тікета.
     if (toolCall != null)
     {
-        var tool = await toolRunner.RunAsync(toolCall, toolArgs, body.Message);
+        var tool = await toolRunner.RunAsync(toolCall, toolArgs, message);
         answer += tool.Suffix;
         var notChecked = tool.NotChecked > 0 ? $", {tool.NotChecked} more not checked (limit {ToolRunner.MaxOrderIds})" : "";
         if (tool.Outcome is ToolOutcome.Ok or ToolOutcome.NotFound or ToolOutcome.NotExecuted)
@@ -272,19 +252,44 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
                 toolCall, requestId, tool.Outcome, tool.Describe(), notChecked,
                 tool.Outcome == ToolOutcome.ValidationRejected ? " (validation: no valid order number in arguments or message, not executed)"
                 : tool.Outcome == ToolOutcome.Timeout ? $" (timeout {toolTimeoutMs} ms for the whole tool call)" : "");
+
+        if (toolCall == "create_ticket")
+        {
+            // дубль (той самий номер з #/№) отримує id наявної заявки; протермінована попередня — нова заявка
+            // і повідомлення, що попередню не опрацювали вчасно (див. ApprovalQueue.ReplySuffix)
+            var queued = approvalQueue.Enqueue(toolCall, guard);
+            answer += ApprovalQueue.ReplySuffix(queued);
+            // у лог — лише id і чи це дубль, без тексту повідомлення
+            app.Logger.LogInformation("approval {ApprovalId} for request {RequestId}: {Kind}",
+                queued.Approval.Id, requestId,
+                !queued.Created ? "duplicate of existing"
+                : queued.PreviousExpiredId is { } prev ? $"queued (previous {prev} expired)" : "queued");
+        }
     }
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
 
-    // лог кожного запиту — з цього живе observability (W1) і cost (W2)
-    await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
+    // лог кожного запиту — з цього живе observability (W1) і cost (W2).
+    // model — та, що відповіла (W4), щоб model і cost_usd у рядку збігались
+    await LogRequest(dbConn, requestId, servedModel, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
 
     return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs });
 });
 
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
-app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));  // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
+app.MapGet("/observability", () => Results.Json(new                                              // W4: fallback_events (число, живе); W5: { p95_ms, requests, cache_hit_pct, error_rate_pct }
+{
+    todo = "aggregate from requests table",
+    // перемикання ланцюжка fallback з моменту старту процесу (лічильник у пам'яті, див. ModelClient.FallbackEvents)
+    fallback_events = modelClient.FallbackEvents,
+    // стан circuit breaker кожної моделі: closed | open | half_open (у пам'яті, див. CircuitBreaker.cs).
+    // консоль його не читає — це для перевірки й eval gate без читання логів
+    circuits = modelClient.CircuitStates(),
+    // HITL: скільки заявок протермінувалось без рішення з моменту старту процесу (у пам'яті, див. ApprovalQueue.ExpiredCount).
+    // консоль його не читає; кожне протермінування ще й окремий рядок у лозі
+    approvals_expired = approvalQueue.ExpiredCount
+}));
 app.MapGet("/cost", async () =>                                                                    // W2/W5: { today_usd, budget_usd }
 {
     // сума рахується в SQL з тим самим created_at::date = CURRENT_DATE, що й у перевірці ментора,
@@ -319,7 +324,7 @@ app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest re
     // activated_by — мітка, яку клієнт назвав сам, а не перевірена особа. Звідки беремо:
     // тіло { "activated_by": "..." } (браузер не пошле кирилицю в заголовку), інакше
     // заголовок X-Activated-By (для curl), інакше NULL. Довге обрізаємо до 100 символів.
-    var by = await ReadActivatedBy(req);
+    var by = await ReadLabel(req, "activated_by");
     if (by.Length == 0)
         by = req.Headers["X-Activated-By"].ToString().Trim();
     string? activatedBy = by.Length == 0 ? null : by.Length > 100 ? by[..100] : by;
@@ -337,9 +342,58 @@ app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest re
     }
 });
 app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
-app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
+// W4 (форма з уроку L08): { pending: [ { id, action, message, created_at } ],
+//   done: [ { id, action, result, approved_by, approved_at } ], rejected: [ { id, action, rejected_by, rejected_at, reason } ],
+//   expired: [ { id, action, created_at, expired_at } ] }
+// у кожному списку найновіші першими; message — замаскований текст (до 200 символів); approved_by / rejected_by /
+// reason — null, якщо не названо. консоль читає pending (id, action); done/rejected/expired — для перевірки й аудиту
+app.MapGet("/approvals", () => Results.Json(approvalQueue.List()));
+// W4: 200 { id, status: "done", result: "TCK-…", approved_by, approved_at };
+// 404 { error } — немає такої заявки, вже оброблена, ще обробляється або протермінована (нічого не змінюється);
+// 503 { error } — тікет не створився, заявка знову pending
+app.MapPost("/approvals/{id}/approve", async (string id, HttpRequest req) =>
+{
+    // approved_by — мітка, яку назвав клієнт, як activated_by в активації промпта: тіло { "approved_by": "..." },
+    // інакше заголовок X-Approved-By, інакше NULL
+    var by = DecisionLabel((await ReadLabels(req, "approved_by"))[0], req.Headers["X-Approved-By"]);
+    DoneApproval? done;
+    try
+    {
+        done = approvalQueue.Approve(id, by);
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogError(ex, "approval {ApprovalId} by {By}: ticket store failed, approval is pending again", id, by ?? "-");
+        return Results.Json(new { error = "ticket store unavailable, approval is pending again" }, statusCode: 503);
+    }
+    if (done == null)
+        return Results.Json(new { error = "approval not found or already done" }, statusCode: 404);
+    // у лог — id заявки й тікета та хто підтвердив, без тексту заявки
+    app.Logger.LogInformation("approval {ApprovalId} approved by {By}: ticket {Ticket}", done.Id, done.ApprovedBy ?? "-", done.Result);
+    return Results.Json(new { id = done.Id, status = "done", result = done.Result,
+        approved_by = done.ApprovedBy, approved_at = done.ApprovedAt });
+});
+// W4: 200 { id, status: "rejected", rejected_by, rejected_at, reason }; той самий 404, що й в approve.
+// тіло { "rejected_by": "...", "reason": "..." } (обидва необовʼязкові), інакше заголовок X-Rejected-By.
+// інструмент не виконується; відхилена заявка звільняє номер замовлення для нової заявки
+app.MapPost("/approvals/{id}/reject", async (string id, HttpRequest req) =>
+{
+    var labels = await ReadLabels(req, "rejected_by", "reason");
+    var by = DecisionLabel(labels[0], req.Headers["X-Rejected-By"]);
+    string? reason = labels[1].Length == 0 ? null : ApprovalQueue.Clip(labels[1], ApprovalQueue.MaxReasonChars);
+    var rejected = approvalQueue.Reject(id, by, reason);
+    if (rejected == null)
+        return Results.Json(new { error = "approval not found or already done" }, statusCode: 404);
+    // причину в лог не пишемо: це вільний текст оператора
+    app.Logger.LogInformation("approval {ApprovalId} rejected by {By}", rejected.Id, rejected.RejectedBy ?? "-");
+    return Results.Json(new { id = rejected.Id, status = "rejected", rejected_by = rejected.RejectedBy,
+        rejected_at = rejected.RejectedAt, reason = rejected.Reason });
+});
 
-app.Logger.LogInformation("MODEL={Model}, fallback chain: {Chain}", defaultModel, FallbackChain);
+app.Logger.LogInformation("MODEL={Model}, fallback chains: {Chains}, attempt timeout {Timeout} ms, "
+    + "circuit breaker: {Threshold} consecutive failures, probe after {Probe} s, open at most {Open} s",
+    defaultModel, ModelClient.DescribeChains(defaultModel), attemptTimeoutMs,
+    circuitOptions.FailureThreshold, circuitOptions.ProbeAfter.TotalSeconds, circuitOptions.OpenDuration.TotalSeconds);
 app.Run("http://0.0.0.0:8080");
 
 // витрати за сьогодні. COALESCE: немає рядків чи всі cost_usd NULL — це 0, а не null.
@@ -409,27 +463,40 @@ static async Task<List<PromptOut>> ListPrompts(string conn)
     return list;
 }
 
-// дістає activated_by з необовʼязкового JSON-тіла. порожнє тіло, {}, не-JSON, не той
-// Content-Type чи не рядок — це "імені немає" (""), а не 400: кнопка без імені шле {}.
-static async Task<string> ReadActivatedBy(HttpRequest req)
+static async Task<string> ReadLabel(HttpRequest req, string field) => (await ReadLabels(req, field))[0];
+
+// дістає рядкові поля (activated_by, approved_by, rejected_by, reason) з необовʼязкового JSON-тіла — за одне
+// читання потоку. порожнє тіло, {}, не-JSON, не той Content-Type чи не рядок — це "значення немає" (""),
+// а не 400: кнопка без імені шле {}.
+static async Task<string[]> ReadLabels(HttpRequest req, params string[] fields)
 {
+    var values = fields.Select(_ => "").ToArray();
     try
     {
         using var sr = new StreamReader(req.Body, Encoding.UTF8, leaveOpen: true);  // потік тіла належить Kestrel
         var raw = await sr.ReadToEndAsync();
         if (string.IsNullOrWhiteSpace(raw))
-            return "";
+            return values;
         using var doc = JsonDocument.Parse(raw);
-        return doc.RootElement.ValueKind == JsonValueKind.Object
-            && doc.RootElement.TryGetProperty("activated_by", out var v)
-            && v.ValueKind == JsonValueKind.String
-            ? (v.GetString() ?? "").Trim()
-            : "";
+        if (doc.RootElement.ValueKind != JsonValueKind.Object)
+            return values;
+        for (var i = 0; i < fields.Length; i++)
+            if (doc.RootElement.TryGetProperty(fields[i], out var v) && v.ValueKind == JsonValueKind.String)
+                values[i] = (v.GetString() ?? "").Trim();
+        return values;
     }
     catch (JsonException)
     {
-        return "";
+        return values;
     }
+}
+
+// хто ухвалив рішення по заявці: з тіла, інакше із заголовка (для curl), інакше NULL.
+// довге обрізаємо до 100 символів, не розриваючи емодзі
+static string? DecisionLabel(string fromBody, string? header)
+{
+    var by = fromBody.Length > 0 ? fromBody : (header ?? "").Trim();
+    return by.Length == 0 ? null : ApprovalQueue.Clip(by, ApprovalQueue.MaxLabelChars);
 }
 
 // перемикає активну версію і пише подію в журнал активацій — в ОДНІЙ транзакції,
@@ -462,8 +529,10 @@ static async Task<int> ActivatePrompt(string conn, string version, string? activ
 }
 
 // пише один рядок у requests. якщо лог впав — запит користувача все одно віддаємо.
-static async Task LogRequest(string conn, Guid id, string model, string promptVersion, int latency,
-    int promptTokens, int completionTokens, decimal? cost, int status)
+// NULL у prompt_version і токенах — у заблокованого guardrails запиту (до реєстру промптів і моделі він не дійшов).
+// NULL лише в токенах — на деградації та на очікуванні невдалого виклику (usage немає); 0 токенів — тільки hit кешу
+static async Task LogRequest(string conn, Guid id, string model, string? promptVersion, int latency,
+    int? promptTokens, int? completionTokens, decimal? cost, int status)
 {
     try
     {
@@ -474,12 +543,12 @@ static async Task LogRequest(string conn, Guid id, string model, string promptVe
             + "VALUES (@id, @model, @pv, @lat, @pt, @ct, @cost, @status)", db);
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("model", model);
-        cmd.Parameters.AddWithValue("pv", promptVersion);
+        cmd.Parameters.AddWithValue("pv", (object?)promptVersion ?? DBNull.Value);
         cmd.Parameters.AddWithValue("lat", latency);
-        cmd.Parameters.AddWithValue("pt", promptTokens);
-        cmd.Parameters.AddWithValue("ct", completionTokens);
+        cmd.Parameters.AddWithValue("pt", (object?)promptTokens ?? DBNull.Value);
+        cmd.Parameters.AddWithValue("ct", (object?)completionTokens ?? DBNull.Value);
         cmd.Parameters.AddWithValue("cost", (object?)cost ?? DBNull.Value);
-        cmd.Parameters.AddWithValue("status", status.ToString());
+        cmd.Parameters.AddWithValue("status", status.ToString(CultureInfo.InvariantCulture));
         await cmd.ExecuteNonQueryAsync();
     }
     catch { /* не валимо запит через лог */ }

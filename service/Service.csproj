@@ -8,4 +8,8 @@
     <PackageReference Include="Npgsql" Version="8.0.3" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.6.2" />
   </ItemGroup>
+  <ItemGroup>
+    <!-- юніт-тести перевіряють внутрішні regex guardrails (MatchTimeout кожного) -->
+    <InternalsVisibleTo Include="tests" />
+  </ItemGroup>
 </Project>

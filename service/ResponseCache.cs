@@ -21,7 +21,10 @@ public sealed record CachedReply(string Content, string? ToolName, string? ToolA
 
 // результат одного виклику моделі: і те, що піде в кеш, і те, що потрібне для рядка в requests.
 // UsageParsed = false — збій (вибачення замість відповіді, вартість невідома).
-public sealed record ModelCall(CachedReply Reply, int Status, bool UsageParsed, int PromptTokens, int CompletionTokens);
+// ServedModel — модель, що фактично відповіла (null — не відповіла жодна, деградація);
+// Hops — скільки разів ланцюжок fallback перемикався (W4, див. ModelClient).
+public sealed record ModelCall(CachedReply Reply, int Status, bool UsageParsed, int PromptTokens, int CompletionTokens,
+    string? ServedModel = null, int Hops = 0);
 
 // Hit — відповідь з кешу; Miss — цей запит сам викликав модель;
 // Joined — однаковий запит уже був у дорозі, і цей дочекався його вдалого результату (власного виклику моделі не було);
@@ -92,7 +95,7 @@ public sealed class ResponseCache
     // скасоване очікування — miss (JoinedFailed). так hits + misses = кількість запитів, і 503 на 20 однакових
     // запитів дає 0 hits і 20 misses, а не 19 і 1.
     // збій лідера чекачі отримують теж (без повтору), але в кеш він не потрапляє (IsCacheable),
-    // тож наступний запит після збою знову піде в модель.
+    // тож наступний запит після збою знову піде в модель. Те саме з відповіддю після fallback (Hops > 0).
     // waitCt скасовує лише очікування цього запиту, а не сам виклик: спільний виклик доходить до кінця
     // і для інших, і для кешу, навіть якщо клієнт лідера відключився.
     // callModel не має кидати; якщо все ж кине — виняток отримають усі, хто чекав, а in-flight запис прибирається.
@@ -154,7 +157,9 @@ public sealed class ResponseCache
             {
                 Interlocked.Increment(ref _misses);
                 var call = await callModel();
-                if (IsCacheable(call.Status, call.UsageParsed, call.Reply))
+                // відповідь після fallback (Hops > 0) не кешуємо: інакше під ключем основної моделі
+                // ще TTL після відновлення лежала б відповідь запасної
+                if (call.Hops == 0 && IsCacheable(call.Status, call.UsageParsed, call.Reply))
                     Set(key, call.Reply);
                 result = new Flight(call.Reply, call);
             }
