@@ -69,6 +69,7 @@ var approvalTtlSeconds = int.TryParse(Environment.GetEnvironmentVariable("APPROV
 // (див. ResponseCache.cs, Tools.cs, ModelClient.cs)
 var responseCache = new ResponseCache(TimeSpan.FromSeconds(cacheTtlSeconds));
 var toolRunner = new ToolRunner(new FakeOrderStore(), TimeSpan.FromMilliseconds(toolTimeoutMs));
+var garbageReplies = new GarbageReplyCounter();  // W5: errors.garbage_reply (див. Observability.cs)
 var modelClient = new ModelClient(app.Services.GetRequiredService<IHttpClientFactory>(), gateway,
     TimeSpan.FromMilliseconds(attemptTimeoutMs), app.Logger,
     circuitOptions, TimeProvider.System, ModelClient.ChainModels(defaultModel));
@@ -182,7 +183,8 @@ app.MapPost("/chat", async (ChatIn body) =>
         app.Logger.LogWarning("guardrail blocked request {RequestId}: {Reason}", requestId, guard.Reason);
         var blockedMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
         await LogRequest(dbConn, requestId, Guardrails.BlockedModel, null, blockedMs, null, null, null, 200);
-        return Results.Json(new { request_id = requestId, content = Guardrails.Refusal, tool = (string?)null, latency_ms = blockedMs });
+        // blocked = true — лише тут (див. Guardrails.BlockedResponse)
+        return Results.Json(Guardrails.BlockedResponse(requestId, blockedMs));
     }
     var message = guard.Masked;
 
@@ -234,6 +236,17 @@ app.MapPost("/chat", async (ChatIn body) =>
     // токени, вартість і статус рядка в requests (правило NULL/0 — див. RequestRow.cs)
     var (promptTokens, completionTokens, costUsd, status) = RequestRow.Compose(lookup, servedModel, CostUsd);
 
+    // garbage (W5): 200 без змісту ("...") — користувачу чесна відповідь; статус '200', токени й вартість лишаються.
+    // не збій провайдера: fallback і запобіжник його не бачать, у кеш не йде (правило — ReplyQuality, Observability.cs).
+    // з tool call не підмінюємо; кожну підміну рахує errors.garbage_reply (GarbageReplyCounter)
+    if (garbageReplies.TryReplace(toolCall, answer, out var honest))
+    {
+        // у лог — лише факт і модель, без тексту повідомлення
+        app.Logger.LogWarning("garbage reply for request {RequestId} from model {Served}, replaced with honest reply",
+            requestId, servedModel);
+        answer = honest;
+    }
+
     // tools + HITL (W3/W4): lookup_order виконуємо (з timeout і валідацією номера, див. Tools.cs) і
     // дописуємо результат до відповіді. виконується на кожному запиті — і на hit, і на очікуванні:
     // single-flight об'єднує лише виклики моделі, не інструменти.
@@ -276,20 +289,32 @@ app.MapPost("/chat", async (ChatIn body) =>
     return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs });
 });
 
-// ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
+// ці ендпоінти читає консоль (ui/src/app/console.component.ts): форма кожного — у коментарі поруч.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
-app.MapGet("/observability", () => Results.Json(new                                              // W4: fallback_events (число, живе); W5: { p95_ms, requests, cache_hit_pct, error_rate_pct }
+// W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events,
+//   errors: { rate_limited_429, provider_5xx, timeout, client_4xx, guardrail_blocked, tool_timeout, garbage_reply },
+//   circuits: { <модель>: closed | open | half_open }, approvals_expired }
+// усі лічильники й плитки — числа; circuits — рядки стану. p95_ms, requests, error_rate_pct і перші п'ять полів errors — з requests за сьогодні
+// (див. Observability.TodaySql і DaySummary). база недоступна — ці поля null, решта є, HTTP 200
+app.MapGet("/observability", async () =>
 {
-    todo = "aggregate from requests table",
-    // перемикання ланцюжка fallback з моменту старту процесу (лічильник у пам'яті, див. ModelClient.FallbackEvents)
-    fallback_events = modelClient.FallbackEvents,
-    // стан circuit breaker кожної моделі: closed | open | half_open (у пам'яті, див. CircuitBreaker.cs).
-    // консоль його не читає — це для перевірки й eval gate без читання логів
-    circuits = modelClient.CircuitStates(),
-    // HITL: скільки заявок протермінувалось без рішення з моменту старту процесу (у пам'яті, див. ApprovalQueue.ExpiredCount).
-    // консоль його не читає; кожне протермінування ще й окремий рядок у лозі
-    approvals_expired = approvalQueue.ExpiredCount
-}));
+    DaySummary? day = null;
+    try
+    {
+        day = await Observability.TodayAsync(dbConn);
+    }
+    catch (Exception ex)
+    {
+        // один рядок без стек-трейсу: консоль опитує цей ендпоінт періодично
+        app.Logger.LogWarning("requests table unavailable ({Error}), GET /observability returns in-memory fields only", ex.Message);
+    }
+    // решта полів — лічильники в пам'яті з моменту старту: див. Observability.HitPct, ModelClient.FallbackEvents,
+    // ToolRunner.Timeouts, GarbageReplyCounter, ModelClient.CircuitStates, ApprovalQueue.ExpiredCount.
+    // errors, circuits і approvals_expired консоль не читає — це для ручної перевірки стану без читання логів
+    return Results.Json(Observability.ObservabilityResponse(day,
+        Observability.HitPct(responseCache.Hits, responseCache.Misses), modelClient.FallbackEvents,
+        toolRunner.Timeouts, garbageReplies.Count, modelClient.CircuitStates(), approvalQueue.ExpiredCount));
+});
 app.MapGet("/cost", async () =>                                                                    // W2/W5: { today_usd, budget_usd }
 {
     // сума рахується в SQL з тим самим created_at::date = CURRENT_DATE, що й у перевірці ментора,
@@ -341,7 +366,11 @@ app.MapPost("/prompts/{version}/activate", async (string version, HttpRequest re
         return Results.Json(new { error = "prompt registry unavailable" }, statusCode: 503);
     }
 });
-app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
+// W5: { providers: [ { name, status } ] } — по одному на кожну модель ланцюжків (ModelClient.ChainModels), status: ok | degraded | down.
+// правило статусу — див. Observability.ProviderStatuses
+app.MapGet("/providers", () => Results.Json(
+    Observability.ProvidersResponse(ModelClient.ChainModels(defaultModel), modelClient.CircuitOf,
+        modelClient.HasClientErrorStreak)));
 // W4 (форма з уроку L08): { pending: [ { id, action, message, created_at } ],
 //   done: [ { id, action, result, approved_by, approved_at } ], rejected: [ { id, action, rejected_by, rejected_at, reason } ],
 //   expired: [ { id, action, created_at, expired_at } ] }

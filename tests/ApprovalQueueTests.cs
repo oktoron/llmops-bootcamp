@@ -27,13 +27,6 @@ public class ApprovalQueueTests
             Func<TState, Exception?, string> formatter) => Lines.Enqueue(formatter(state, exception));
     }
 
-    private sealed class ManualTimeProvider : TimeProvider
-    {
-        private DateTimeOffset _now = new(2026, 10, 17, 12, 0, 0, TimeSpan.Zero);
-        public override DateTimeOffset GetUtcNow() => _now;
-        public void Advance(TimeSpan by) => _now += by;
-    }
-
     // перший виклик падає, далі — як справжній фейк
     private sealed class FlakyTicketStore : ITicketStore
     {

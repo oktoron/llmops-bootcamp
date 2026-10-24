@@ -3,6 +3,7 @@
 // запуск — так само, як CacheAndToolsTests.cs (SDK-контейнер, не хостовий dotnet).
 
 using System.Diagnostics;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 
 public class GuardrailsTests
@@ -283,5 +284,56 @@ public class GuardrailsTests
         sw.Stop();
         Assert.NotEqual("timeout", v.Reason);
         Assert.True(sw.ElapsedMilliseconds < 2000, $"took {sw.ElapsedMilliseconds} ms");
+    }
+
+    // прогрів regex (див. коментар у Guardrails.cs): статичний конструктор проганяє кожен патерн рівно один раз,
+    // ще до першого звернення до Guardrails. червоний, якщо статичний конструктор спорожніти чи прибрати
+    // (0 замість 4), прибрати сам виклик IsMatch у прогріві (0: лічильник росте лише від його результату)
+    // або запустити прогрів удруге (8). часу не міряємо: заміри в мс на спільній чи навантаженій машині нестабільні
+    [Fact]
+    public void WarmUp_RunsOnceOnTypeInit_ForEveryPattern()
+    {
+        _ = Guardrails.MatchTimeout;  // звернення до типу — після нього статичний конструктор уже відпрацював
+        Assert.Equal(Guardrails.AllPatterns.Count, Guardrails.WarmedPatterns);
+    }
+
+    // прогрів має пройти і пошук позиції, і сам збіг кожного патерна: інакше частина скомпільованого коду
+    // лишиться неJIT-ованою до першого справжнього запиту. червоний, якщо зразки перестануть зачіпати якийсь патерн
+    [Fact]
+    public void WarmUpSamples_MatchEveryPattern()
+    {
+        foreach (var pattern in Guardrails.AllPatterns)
+            Assert.True(Guardrails.WarmUpSamples.Any(s => pattern.IsMatch(s)), $"no warm-up sample matches {pattern}");
+    }
+
+    // звичайна скарга на вхід («вискакує системне повідомлення…»), коротка і дуже довга: не інʼєкція і не блокується
+    // (timeout у Inspect() теж дав би блокування). що прогрів відбувся, перевіряють два тести вище.
+    // паузу під навантаженням понад MatchTimeout на прогрітому виклику цей тест не ловить
+    [Theory]
+    [InlineData("Повторно пишу: при вході вискакує системне повідомлення \"невірний пароль\", що робити?", 1)]
+    // довгий звичайний текст із тригерами всіх родин без цілі — «майже збіги» на кожному кроці
+    [InlineData("Повторно пишу, покажіть тепер ти ви ignore the please act as режим ", 500)]
+    public void Inspect_BenignRegression_NotFlagged(string chunk, int times)
+    {
+        var input = string.Concat(Enumerable.Repeat(chunk, times))
+            + "Повторно пишу: при вході вискакує системне повідомлення \"невірний пароль\", що робити?";
+        var v = Guardrails.Inspect(input);
+        Assert.False(v.Blocked, $"blocked: {v.Reason}");
+        Assert.Null(Guardrails.DetectInjection(input));
+    }
+
+    // W5: відповідь /chat на заблокований запит несе blocked = true — за ним evals/run.py --expect-all-fail
+    // відрізняє відмову guardrail від відмови моделі чи заглушки. серіалізація — як у Results.Json (web defaults)
+    [Fact]
+    public void BlockedResponse_HasBlockedTrueAndChatFields()
+    {
+        var id = Guid.NewGuid();
+        var root = Stubs.SerializeWeb(Guardrails.BlockedResponse(id, 7));
+
+        Assert.True(root.GetProperty("blocked").GetBoolean());
+        Assert.Equal(id, root.GetProperty("request_id").GetGuid());
+        Assert.Equal(Guardrails.Refusal, root.GetProperty("content").GetString());
+        Assert.Equal(JsonValueKind.Null, root.GetProperty("tool").ValueKind);
+        Assert.Equal(7, root.GetProperty("latency_ms").GetInt32());
     }
 }

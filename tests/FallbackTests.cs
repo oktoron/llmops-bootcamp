@@ -8,21 +8,13 @@ using System.Text.Json;
 
 public class FallbackTests
 {
-    private static readonly ChatMessage[] Msgs =
-        { new ChatMessage("system", "support"), new ChatMessage("user", "Привіт") };
-
-    private static string OkBody(string content) => JsonSerializer.Serialize(new
-    {
-        choices = new[] { new { message = new { role = "assistant", content } } },
-        usage = new { prompt_tokens = 10, completion_tokens = 5 }
-    });
-
     // відповідь: статус + тіло, або виняток (немає відповіді), або затримка понад timeout спроби
     private sealed record Step(HttpStatusCode Status = HttpStatusCode.OK, string? Body = null,
         Exception? Throw = null, TimeSpan? Delay = null);
 
-    private static Step Ok(string content) => new(HttpStatusCode.OK, OkBody(content));
-    private static Step Code(int code) => new((HttpStatusCode)code, "{\"error\":{\"message\":\"boom\"}}");
+    // тіла відповідей — спільні (TestStubs.cs)
+    private static Step Ok(string content) => new(HttpStatusCode.OK, GatewayStub.OkBody(content));
+    private static Step Code(int code) => new((HttpStatusCode)code, GatewayStub.ErrorBody);
 
     // віддає відповіді з черги по черзі й записує, яку модель просив кожен запит
     private sealed class ScriptedHandler : HttpMessageHandler
@@ -49,15 +41,10 @@ public class FallbackTests
         }
     }
 
-    private sealed class Factory : IHttpClientFactory
-    {
-        private readonly HttpMessageHandler _handler;
-        public Factory(HttpMessageHandler handler) => _handler = handler;
-        public HttpClient CreateClient(string name) => new(_handler, disposeHandler: false);
-    }
-
+    // фабрика HttpClient — спільна (StubHttpClientFactory у TestStubs.cs). не Stubs.Client, бо тут свій ScriptedHandler
+    // (відповідає по черзі, а не за моделлю), опції за замовчуванням і системний годинник; запобіжники є (поріг 3)
     private static ModelClient Client(ScriptedHandler handler, TimeSpan? timeout = null) =>
-        new(new Factory(handler), "http://gateway:4000", timeout);
+        new(new StubHttpClientFactory(handler), "http://gateway:4000", timeout);
 
     private static string[] MockChain(string routed) => ModelClient.Chain(routed, "mock");
 
@@ -67,7 +54,7 @@ public class FallbackTests
         var handler = new ScriptedHandler(Code(503), Ok("Відповідь mock-mid"));
         var client = Client(handler);
 
-        var call = await client.CallAsync(MockChain("mock-strong"), Msgs);
+        var call = await client.CallAsync(MockChain("mock-strong"), Stubs.Msgs());
 
         Assert.Equal("Відповідь mock-mid", call.Reply.Content);
         Assert.Equal(200, call.Status);
@@ -84,7 +71,7 @@ public class FallbackTests
         var handler = new ScriptedHandler(Ok("Вітаю"));
         var client = Client(handler);
 
-        var call = await client.CallAsync(MockChain("mock-strong"), Msgs);
+        var call = await client.CallAsync(MockChain("mock-strong"), Stubs.Msgs());
 
         Assert.Equal("mock-strong", call.ServedModel);
         Assert.Equal(0, call.Hops);
@@ -98,7 +85,7 @@ public class FallbackTests
         var handler = new ScriptedHandler(Code(503), Code(503), Code(503));
         var client = Client(handler);
 
-        var call = await client.CallAsync(MockChain("mock-strong"), Msgs);
+        var call = await client.CallAsync(MockChain("mock-strong"), Stubs.Msgs());
 
         Assert.Equal(ModelClient.DegradedReply, call.Reply.Content);
         Assert.Null(call.Reply.ToolName);
@@ -110,14 +97,14 @@ public class FallbackTests
         Assert.Equal(new[] { "mock-strong", "mock-mid", "mock-mini" }, handler.Models);
     }
 
-    // дриль ментора: __fail_503 без маркерів маршруту йде на mock-mini, ланцюжок mini -> mid — рівно +1
+    // drill ментора: __fail_503 без маркерів маршруту йде на mock-mini, ланцюжок mini -> mid — рівно +1
     [Fact]
     public async Task AllFail503_OnMini_CountsExactlyOne()
     {
         var handler = new ScriptedHandler(Code(503), Code(503));
         var client = Client(handler);
 
-        var call = await client.CallAsync(MockChain("mock-mini"), Msgs);
+        var call = await client.CallAsync(MockChain("mock-mini"), Stubs.Msgs());
 
         Assert.Equal(ModelClient.DegradedReply, call.Reply.Content);
         Assert.Equal(1, client.FallbackEvents);
@@ -131,13 +118,14 @@ public class FallbackTests
         var handler = new ScriptedHandler(Code(503), Code(503), Code(503), Code(503), Code(503));
         var client = Client(handler);
 
-        await client.CallAsync(MockChain("mock-mini"), Msgs);
-        await client.CallAsync(MockChain("mock-strong"), Msgs);
+        await client.CallAsync(MockChain("mock-mini"), Stubs.Msgs());
+        await client.CallAsync(MockChain("mock-strong"), Stubs.Msgs());
 
         Assert.Equal(3, client.FallbackEvents);
     }
 
-    // 404 від LiteLLM — описка в аліасі: перемикання її сховало б
+    // 4xx — помилка запиту або конфігурації, а не провайдера (описка в аліасі — LiteLLM віддає 400 Invalid model name):
+    // перемикання її сховало б
     [Theory]
     [InlineData(404)]
     [InlineData(400)]
@@ -147,7 +135,7 @@ public class FallbackTests
         var handler = new ScriptedHandler(Code(code));
         var client = Client(handler);
 
-        var call = await client.CallAsync(MockChain("mock-strong"), Msgs);
+        var call = await client.CallAsync(MockChain("mock-strong"), Stubs.Msgs());
 
         Assert.Single(handler.Models);
         Assert.Equal(0, client.FallbackEvents);
@@ -164,7 +152,7 @@ public class FallbackTests
         var handler = new ScriptedHandler(Code(503), Code(404));
         var client = Client(handler);
 
-        var call = await client.CallAsync(MockChain("mock-strong"), Msgs);
+        var call = await client.CallAsync(MockChain("mock-strong"), Stubs.Msgs());
 
         Assert.Equal(new[] { "mock-strong", "mock-mid" }, handler.Models);
         Assert.Equal(404, call.Status);
@@ -181,7 +169,7 @@ public class FallbackTests
         var handler = new ScriptedHandler(Code(code), Ok("ok"));
         var client = Client(handler);
 
-        var call = await client.CallAsync(MockChain("mock-mid"), Msgs);
+        var call = await client.CallAsync(MockChain("mock-mid"), Stubs.Msgs());
 
         Assert.Equal("mock-mini", call.ServedModel);
         Assert.Equal(1, client.FallbackEvents);
@@ -194,7 +182,7 @@ public class FallbackTests
         var handler = new ScriptedHandler(new Step(Throw: new HttpRequestException("connection refused")), Ok("ok"));
         var client = Client(handler);
 
-        var call = await client.CallAsync(MockChain("mock-mid"), Msgs);
+        var call = await client.CallAsync(MockChain("mock-mid"), Stubs.Msgs());
 
         Assert.Equal("mock-mini", call.ServedModel);
         Assert.Equal(1, client.FallbackEvents);
@@ -207,7 +195,7 @@ public class FallbackTests
             new Step(Throw: new HttpRequestException("down")), new Step(Throw: new HttpRequestException("down")));
         var client = Client(handler);
 
-        var call = await client.CallAsync(MockChain("mock-mini"), Msgs);
+        var call = await client.CallAsync(MockChain("mock-mini"), Stubs.Msgs());
 
         Assert.Equal(0, call.Status);
         Assert.Equal(ModelClient.DegradedReply, call.Reply.Content);
@@ -220,7 +208,7 @@ public class FallbackTests
         var handler = new ScriptedHandler(new Step(HttpStatusCode.OK, "not json at all"), Ok("ok"));
         var client = Client(handler);
 
-        var call = await client.CallAsync(MockChain("mock-strong"), Msgs);
+        var call = await client.CallAsync(MockChain("mock-strong"), Stubs.Msgs());
 
         Assert.Equal("ok", call.Reply.Content);
         Assert.Equal("mock-mid", call.ServedModel);
@@ -235,7 +223,7 @@ public class FallbackTests
         var client = Client(handler, TimeSpan.FromMilliseconds(100));
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
-        var call = await client.CallAsync(MockChain("mock-strong"), Msgs);
+        var call = await client.CallAsync(MockChain("mock-strong"), Stubs.Msgs());
         sw.Stop();
 
         Assert.Equal("mock-mid", call.ServedModel);
@@ -291,7 +279,7 @@ public class FallbackTests
         var handler = new ScriptedHandler(step, Ok("не має бути запитано"));
         var client = Client(handler);
 
-        var call = await client.CallAsync(ModelClient.Chain(ModelClient.MiniModel, "mock", overBudget: true), Msgs);
+        var call = await client.CallAsync(ModelClient.Chain(ModelClient.MiniModel, "mock", overBudget: true), Stubs.Msgs());
 
         Assert.Equal(ModelClient.DegradedReply, call.Reply.Content);
         Assert.Equal(code, call.Status);
@@ -308,7 +296,7 @@ public class FallbackTests
         var handler = new ScriptedHandler(Code(503), Ok("Відповідь mock-mid"));
         var client = Client(handler);
 
-        var call = await client.CallAsync(ModelClient.Chain(ModelClient.MiniModel, "mock", overBudget: false), Msgs);
+        var call = await client.CallAsync(ModelClient.Chain(ModelClient.MiniModel, "mock", overBudget: false), Stubs.Msgs());
 
         Assert.Equal("mock-mid", call.ServedModel);
         Assert.Equal(1, call.Hops);
@@ -332,10 +320,10 @@ public class FallbackTests
         var handler = new ScriptedHandler(Code(503), Ok("Відповідь mock-mid"), Code(503), Ok("Відповідь mock-mid"));
         var client = Client(handler);
         var cache = new ResponseCache(TimeSpan.FromMinutes(10));
-        var key = ResponseCache.Key("mock-strong", "v2", Msgs);
+        var key = ResponseCache.Key("mock-strong", "v2", Stubs.Msgs());
 
-        var first = await cache.GetOrCallAsync(key, () => client.CallAsync(MockChain("mock-strong"), Msgs));
-        var second = await cache.GetOrCallAsync(key, () => client.CallAsync(MockChain("mock-strong"), Msgs));
+        var first = await cache.GetOrCallAsync(key, () => client.CallAsync(MockChain("mock-strong"), Stubs.Msgs()));
+        var second = await cache.GetOrCallAsync(key, () => client.CallAsync(MockChain("mock-strong"), Stubs.Msgs()));
 
         Assert.Equal(CacheSource.Miss, first.Source);
         Assert.Equal(CacheSource.Miss, second.Source);
@@ -350,10 +338,10 @@ public class FallbackTests
         var handler = new ScriptedHandler(Ok("Вітаю"));
         var client = Client(handler);
         var cache = new ResponseCache(TimeSpan.FromMinutes(10));
-        var key = ResponseCache.Key("mock-mini", "v2", Msgs);
+        var key = ResponseCache.Key("mock-mini", "v2", Stubs.Msgs());
 
-        await cache.GetOrCallAsync(key, () => client.CallAsync(MockChain("mock-mini"), Msgs));
-        var second = await cache.GetOrCallAsync(key, () => client.CallAsync(MockChain("mock-mini"), Msgs));
+        await cache.GetOrCallAsync(key, () => client.CallAsync(MockChain("mock-mini"), Stubs.Msgs()));
+        var second = await cache.GetOrCallAsync(key, () => client.CallAsync(MockChain("mock-mini"), Stubs.Msgs()));
 
         Assert.Equal(CacheSource.Hit, second.Source);
         Assert.Single(handler.Models);

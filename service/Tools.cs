@@ -69,6 +69,12 @@ public sealed class ToolRunner
 
     private readonly IOrderStore _orders;
     private readonly TimeSpan _timeout;
+    private long _timeouts;
+
+    // скільки викликів інструмента не вклались у бюджет часу (TOOL_TIMEOUT_MS) з моменту старту процесу —
+    // для errors.tool_timeout у /observability (W5). рахуємо виклик, а не номер: три повільні номери — це 1.
+    // ОБМЕЖЕННЯ: у пам'яті процесу, як і fallback_events — перезапуск сервісу обнуляє.
+    public long Timeouts => Interlocked.Read(ref _timeouts);
 
     public ToolRunner(IOrderStore orders, TimeSpan timeout)
     {
@@ -217,6 +223,8 @@ public sealed class ToolRunner
             : orders.Any(o => o.Outcome == ToolOutcome.Failed) ? ToolOutcome.Failed
             : orders.Any(o => o.Outcome == ToolOutcome.Ok) ? ToolOutcome.Ok
             : ToolOutcome.NotFound;
+        if (outcome == ToolOutcome.Timeout)
+            Interlocked.Increment(ref _timeouts);
         return new ToolResult(outcome, orders, ids.NotChecked, Suffix(orders, ids.NotChecked));
     }
 
