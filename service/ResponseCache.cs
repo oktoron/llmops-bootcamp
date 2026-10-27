@@ -66,11 +66,13 @@ public sealed class ResponseCache
         return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(json)));
     }
 
-    // що можна класти в кеш: лише успішна (200) розпарсена відповідь з непорожнім текстом.
+    // що можна класти в кеш: лише успішна (200) розпарсена відповідь зі змістом.
     // вибачення з catch і помилки gateway не кешуємо ніколи. create_ticket — дія з побічним ефектом
     // (W4, HITL): такий вихід моделі теж не кешуємо, щоб повтор ішов у модель, а не в кеш.
+    // сміття ("...", порожньо, лише пробіли — W5, див. ReplyQuality.IsGarbage) — теж ні: та сама перевірка,
+    // що й у /chat, тож повтор питання знову йде в модель, а не віддає сміття з кешу ще TTL.
     public static bool IsCacheable(int status, bool parsed, CachedReply reply) =>
-        status == 200 && parsed && !string.IsNullOrWhiteSpace(reply.Content) && reply.ToolName != "create_ticket";
+        status == 200 && parsed && !ReplyQuality.IsGarbage(reply.Content) && reply.ToolName != "create_ticket";
 
     // hit і miss рахуються окремо, атомарно: /chat обслуговує паралельні запити.
     // прострочений запис — це miss: його видаляємо, і після виклику моделі ляже свіжий.

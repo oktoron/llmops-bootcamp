@@ -4,6 +4,7 @@
 // ОБМЕЖЕННЯ: лічильник перемикань і стан circuit breaker (див. CircuitBreaker.cs) живуть у пам'яті процесу —
 // перезапуск сервісу обнуляє лічильник і закриває всі запобіжники.
 
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Logging;
@@ -16,9 +17,11 @@ public sealed class ModelClient
     public const string StrongModel = "mock-strong";
 
     // graceful degradation: одна стала відповідь, коли ланцюжок вичерпано. HTTP лишається 200.
-    // свідомо без цифр і без жодного ключового слова evals (тікет, статус, email, допомог, не можу, cannot, refuse):
-    // під час повної відмови жоден eval-кейс не має пройти випадково (HW5). «вибачте» безпечне — його
-    // навмисно немає в списку відмов.
+    // свідомо без цифр, без жодного expect-слова з evals/golden.jsonl і без маркерів відмови з grade() в evals/run.py:
+    // під час повної відмови жоден eval-кейс не має пройти випадково (HW5). «вибачте» безпечне — його навмисно немає
+    // серед маркерів відмови. п'ять кейсів з expect, доданих у HW5, ще й мають forbid «технічні труднощі»: поки ці слова
+    // в заглушці, вони червоні на ній навіть за випадкового збігу expect-слова. старі кейси й expect_refusal такого
+    // запасу не мають (forbid на expect_refusal grade() не читає) — там захищає лише сам текст заглушки.
     public const string DegradedReply =
         "Вибачте, зараз у нас тимчасові технічні труднощі. Спробуйте, будь ласка, ще раз за кілька хвилин.";
 
@@ -32,6 +35,8 @@ public sealed class ModelClient
     private readonly ILogger? _log;
     private readonly CircuitRegistry _circuits;
     private long _fallbackEvents;
+    // скільки спроб поспіль на кожну модель закінчились 4xx (не 429) — див. HasClientErrorStreak
+    private readonly ConcurrentDictionary<string, int> _clientErrorStreaks = new();
 
     // knownModels — моделі, чиї запобіжники /observability показує ще до першого запиту.
     // time — годинник запобіжників (тест підставляє свій, щоб не чекати секунди проби)
@@ -50,6 +55,47 @@ public sealed class ModelClient
 
     public CircuitState CircuitOf(string model) => _circuits.For(model).State;
 
+    // серія 4xx (не 429) для /providers (W5): запобіжник 4xx не рахує, тож без серії описка в аліасі давала б ok.
+    // FailureThreshold поспіль — degraded; IsInputRejection-400 серію не чіпає, скидає 200/429/5xx/0.
+    // сама не згасає (скидає перша вдала спроба), у пам'яті; запобіжник і fallback не чіпає.
+    public bool HasClientErrorStreak(string model) =>
+        _clientErrorStreaks.TryGetValue(model, out var n) && n >= _circuits.Options.FailureThreshold;
+
+    // відмова через вміст запиту, а не конфігурацію: тіло 400 від LiteLLM ({"error": {"message", "code", ...}}).
+    // message несе назву винятку LiteLLM; type не беремо — це лише підказка, часто null. Що не розпізнали
+    // (не JSON, інша форма, порожнє тіло) — звичайний 4xx, тобто рахується в серію, як і раніше.
+    public static bool IsInputRejection(string? body)
+    {
+        if (string.IsNullOrWhiteSpace(body))
+            return false;
+        try
+        {
+            using var doc = JsonDocument.Parse(body);
+            if (doc.RootElement.ValueKind != JsonValueKind.Object
+                || !doc.RootElement.TryGetProperty("error", out var error) || error.ValueKind != JsonValueKind.Object)
+                return false;
+            if (error.TryGetProperty("message", out var m) && m.ValueKind == JsonValueKind.String
+                && m.GetString() is { } message
+                && (message.Contains("ContextWindowExceededError", StringComparison.Ordinal)
+                    || message.Contains("ContentPolicyViolationError", StringComparison.Ordinal)))
+                return true;
+            return error.TryGetProperty("code", out var c) && c.ValueKind == JsonValueKind.String
+                && c.GetString() == "context_length_exceeded";
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+    }
+
+    private void TrackClientError(string model, int status)
+    {
+        if (status is >= 400 and < 500 and not 429)
+            _clientErrorStreaks.AddOrUpdate(model, 1, (_, n) => n + 1);
+        else
+            _clientErrorStreaks[model] = 0;
+    }
+
     // усі моделі, що можуть трапитись у ланцюжках при цьому MODEL
     public static string[] ChainModels(string defaultModel) =>
         new[] { StrongModel, MidModel, MiniModel }
@@ -62,7 +108,7 @@ public sealed class ModelClient
     public long FallbackEvents => Interlocked.Read(ref _fallbackEvents);
 
     // fallback chain для обраної Route() моделі. Кожен tier падає на дешевший; mock-mini — на mock-mid,
-    // бо інакше в нього не було б другого кроку, а саме туди йде дриль __fail_503 без маркерів маршруту.
+    // бо інакше в нього не було б другого кроку, а саме туди йде drill __fail_503 без маркерів маршруту.
     // ОБМЕЖЕННЯ: усі mock-аліаси живуть на одному провайдері, тож падіння провайдера цей ланцюжок не переживе.
     // Провайдер з іншим ключем (gemini — закоментований блок у gateway/litellm-config.yaml) став би другим кроком.
     // Реальна модель із MODEL — ланцюжок з одного елемента: запасної моделі її власник не задавав.
@@ -93,7 +139,10 @@ public sealed class ModelClient
     // чи варто йти на наступну модель після невдалої спроби з цим статусом:
     // 0 — відповіді не було (мережа, timeout), 429 — ліміт, 5xx — збій провайдера чи gateway,
     // 200 — сюди доходить лише 200, що не розпарсився (вдалий повертається раніше).
-    // 400/401/404 та інші — помилка конфігурації (404 від LiteLLM — описка в аліасі): перемикання її сховало б.
+    // 400/401/404 та інші — помилка запиту або конфігурації (напр. 400 від закріпленого LiteLLM на описку в аліасі):
+    // перемикання її сховало б. відмова через вміст запиту (IsInputRejection) — теж без перемикання; fallback на модель
+    // з більшим вікном чи іншою політикою — свідоме «не роблю». від інших 4xx вона відрізняється двічі: не рахується
+    // в серію 4xx і дає CircuitOutcome.Ignored — у HalfOpen проба не перезводить таймер (5 с), наступний запит пробує одразу.
     public static bool ShouldFallback(int status) => status is 0 or 200 or 429 || status >= 500;
 
     // один прохід ланцюжком — фабрика для single-flight у ResponseCache.GetOrCallAsync.
@@ -139,10 +188,15 @@ public sealed class ModelClient
             var outcome = CircuitOutcome.Failure;
             try
             {
-                (call, status) = await AttemptAsync(chain[i], messages);
+                bool inputRejected;
+                (call, status, inputRejected) = await AttemptAsync(chain[i], messages);
                 outcome = call != null ? CircuitOutcome.Success
                     : ShouldFallback(status) ? CircuitOutcome.Failure
+                    : inputRejected ? CircuitOutcome.Ignored
                     : CircuitOutcome.Neutral;
+                // відмова через вміст запиту про стан моделі нічого не каже: серія 4xx лишається, як була
+                if (!inputRejected)
+                    TrackClientError(chain[i], status);
             }
             finally
             {
@@ -172,7 +226,8 @@ public sealed class ModelClient
 
     // одна спроба на одну модель. Call == null — невдача, Status — що відповів gateway (0 — нічого).
     // статус перевіряємо ДО розбору: тіло помилки LiteLLM — інший JSON, і розбирати його як відповідь не можна.
-    private async Task<(ModelCall? Call, int Status)> AttemptAsync(string model, ChatMessage[] messages)
+    // InputRejected — 400, у якому LiteLLM відмовив через вміст запиту (див. IsInputRejection).
+    private async Task<(ModelCall? Call, int Status, bool InputRejected)> AttemptAsync(string model, ChatMessage[] messages)
     {
         var payload = JsonSerializer.Serialize(new { model, messages });
         var status = 0;
@@ -184,8 +239,12 @@ public sealed class ModelClient
                 $"{_gateway}/v1/chat/completions",
                 new StringContent(payload, Encoding.UTF8, "application/json"), cts.Token);
             status = (int)response.StatusCode;
+            // PostAsync уже буферизував тіло: обрив чи timeout під час передачі — це виняток вище (status 0, fallback);
+            // тіло, яке не розібралось, — звичайний 4xx; якщо читання все ж кине, catch нижче поверне (null, 400, false)
+            if (status == 400)
+                return (null, status, IsInputRejection(await response.Content.ReadAsStringAsync(cts.Token)));
             if (status != 200)
-                return (null, status);
+                return (null, status, false);
 
             var rawJson = await response.Content.ReadAsStringAsync(cts.Token);
             using var doc = JsonDocument.Parse(rawJson);
@@ -206,13 +265,13 @@ public sealed class ModelClient
             var usage = doc.RootElement.GetProperty("usage");
             return (new ModelCall(new CachedReply(answer, toolCall, toolArgs), status, true,
                 usage.GetProperty("prompt_tokens").GetInt32(), usage.GetProperty("completion_tokens").GetInt32(),
-                model, 0), status);
+                model, 0), status, false);
         }
         catch (Exception ex)
         {
             // мережа/gateway недоступні, timeout спроби (status лишається 0) або 200 з тілом, що не розпарсилось
             _log?.LogWarning("model {Model} attempt failed with status {Status}: {Error}", model, status, ex.GetType().Name);
-            return (null, status);
+            return (null, status, false);
         }
     }
 }

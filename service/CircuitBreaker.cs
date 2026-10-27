@@ -12,8 +12,10 @@ public enum CircuitState { Closed, Open, HalfOpen }
 // Allow — звичайний виклик; Probe — цей запит і є пробою (єдиний); Skip — модель відкрита, її пропускаємо
 public enum CircuitDecision { Allow, Probe, Skip }
 
-// Neutral — 4xx (400/401/404...): помилка конфігурації, а не стан моделі — ні збій, ні успіх
-public enum CircuitOutcome { Success, Failure, Neutral }
+// Neutral — 4xx (400/401/404...): помилка запиту або конфігурації — ні збій, ні успіх; невдала проба → знову Open.
+// Ignored — відмова через вміст запиту (IsInputRejection): про модель нічого не каже; на пробі лише звільняє слот,
+// наступний запит — нова проба
+public enum CircuitOutcome { Success, Failure, Neutral, Ignored }
 
 // ProbeInterval — через скільки після відкриття (чи після невдалої проби) пускаємо пробу;
 // OpenDuration — верхня межа: після неї проба дозволена завжди. Закриває лише вдала проба, а не таймер.
@@ -74,6 +76,7 @@ public sealed class CircuitBreaker
 
     // результат виклику. ModelClient кличе це у finally, тож слот проби звільняється на кожному шляху:
     // timeout (status 0), виняток, 4xx — HalfOpen, що ніколи не завершиться, неможливий.
+    // закриває лише Success на пробі; Ignored у Closed — як Neutral (серію збоїв не чіпає в жоден бік).
     // status — лише для логу (останній статус спроби)
     public void Record(CircuitOutcome outcome, bool wasProbe, long generation, int status = 0)
     {
@@ -87,9 +90,17 @@ public sealed class CircuitBreaker
                     _failures = 0;
                     _log?.LogInformation("circuit {Model} closed after successful probe", _model);
                 }
+                else if (outcome == CircuitOutcome.Ignored)
+                {
+                    // проба нічого не довела ні в той, ні в інший бік: знову Open, але _openedAt і _generation
+                    // не чіпаємо — ProbeAfter уже минув, тож наступний запит одразу стане новою пробою.
+                    // закрити не можна: такий 400 не доводить, що провайдер живий — з enable_pre_call_checks LiteLLM відхиляє ще до виклику провайдера
+                    _state = CircuitState.Open;
+                    _log?.LogInformation("circuit {Model} probe ignored (input rejection), next request probes", _model);
+                }
                 else
                 {
-                    // невдала чи нейтральна проба: знову Open, обидва таймери від цього моменту
+                    // невдала чи нейтральна (4xx запиту чи конфігурації) проба: знову Open, обидва таймери від цього моменту
                     _state = CircuitState.Open;
                     _openedAt = _time.GetUtcNow();
                     _generation++;

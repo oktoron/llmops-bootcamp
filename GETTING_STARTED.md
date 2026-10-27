@@ -298,7 +298,7 @@ Eval прогоняє кейси з `golden.jsonl` через сервіс і р
 docker run --rm --network <project>_default \
   -e SERVICE_URL=http://service:8080 -e PYTHONUTF8=1 \
   -v "$(pwd)/evals:/e:ro" python:3.12-slim \
-  python /e/run.py --dataset /e/golden.jsonl --threshold 5
+  python /e/run.py --dataset /e/golden.jsonl --threshold 31
 ```
 
 `<project>` — префікс мережі (звичайно ім'я папки; глянь `docker network ls`).
@@ -313,7 +313,7 @@ docker run --rm --network <project>_default \
 MSYS_NO_PATHCONV=1 docker run --rm --network <project>_default \
   -e SERVICE_URL=http://service:8080 -e PYTHONUTF8=1 \
   -v "$(pwd -W)/evals:/e:ro" python:3.12-slim \
-  python /e/run.py --dataset /e/golden.jsonl --threshold 5
+  python /e/run.py --dataset /e/golden.jsonl --threshold 31
 ```
 
 `MSYS_NO_PATHCONV=1` захищає шляхи-аргументи контейнера, а `$(pwd -W)` дає
@@ -323,22 +323,31 @@ Windows-шлях джерела монтування, який Docker Desktop р
 Або з хоста (якщо `8080` вільний і без проксі):
 
 ```bash
-SERVICE_URL=http://localhost:8080 python evals/run.py --dataset evals/golden.jsonl --threshold 5
+SERVICE_URL=http://localhost:8080 python evals/run.py --dataset evals/golden.jsonl --threshold 31
 ```
 
 ```powershell
 # PowerShell-варіант того самого
-$env:SERVICE_URL="http://localhost:8080"; python evals/run.py --dataset evals/golden.jsonl --threshold 5
+$env:SERVICE_URL="http://localhost:8080"; python evals/run.py --dataset evals/golden.jsonl --threshold 31
 ```
 
-Вихід: `eval: 6/6 passed, threshold 5`, код виходу `0` (green) або `1` (red).
+Вихід: `eval: 32/32 passed, threshold 31`, код виходу `0` (green) або `1` (red).
 
-**Про поріг.** `--threshold` — це **кількість** пройдених кейсів, а не частка. 5 з 6
-дозволяє рівно один флейк. Додаєш кейс — піднімай поріг у тій самій зміні, інакше гейт
-**тихо** стає м'якшим: 5 з 7 терпить уже два червоні кейси, і жодного попередження про це
+**Про поріг.** `--threshold` — це **кількість** пройдених кейсів, а не частка. У цьому
+репозиторії набір — 32 кейси (щонайменше три кожного типу за префіксом id), поріг — N − 1 = 31:
+рівно один флейк. Правило hw5 вимагає N − 1 лише до 10 кейсів, а далі `ceil(0.85·N)` (для 32 —
+це 28); тут свідомо тримаємо N − 1 за будь-якого N — чому, див.
+[README](README.md#eval-gate-32-кейси-поріг-31).
+Додаєш кейс — піднімай поріг у тій самій зміні, інакше гейт
+**тихо** стає м'якшим: 31 з 33 терпить уже два червоні кейси, і жодного попередження про це
 не буде. **CI курсу бере поріг із `.github/workflows/eval-gate.yml`, а не з цих команд**,
 тож міняй його в обох місцях. І навіть зелений гейт пропускає один червоний кейс — дивись
 на рядки окремих кейсів, а не лише на код виходу.
+
+Перевірка датасету на фальш-позитиви (hw5, `__fail_503 ` перед кожним кейсом) — та сама
+команда з `--input-prefix "__fail_503 " --expect-all-fail` замість `--threshold`; що вона
+має показати і чому її запускають **після** звичайного прогону — у
+[README](README.md#перевірка-на-фальш-позитиви).
 
 **Як гейт ловить регресію:** сервіс шле system-промпт зі словом «support» → mock віддає
 канонічні відповіді → evals зелені. Зламай промпт (прибери «support») → mock почне
