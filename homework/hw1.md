@@ -18,7 +18,7 @@
    `v2` = `You are a support assistant. Be concise and helpful.`, активна — `v2`)
    і піднімає базу заново: `docker compose down -v && docker compose up -d`
    (міграція виконується лише на чистому томі — без `-v` зміни в `schema.sql` не застосуються).
-3. Переносить system-промпт із хардкоду (`service/Program.cs`, `TODO(student, W1)`) у
+3. Переносить system-промпт із хардкоду (`service/Program.cs`) у
    таблицю `prompts`: сервіс бере активну версію. Дефолт на випадок порожнього реєстру —
    **без** слова «support», щоб поломка реєстру була видна, а не замаскована.
 4. Пише версію промпта (`prompt_version`) у кожен лог-рядок.

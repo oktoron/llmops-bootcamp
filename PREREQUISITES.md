@@ -45,7 +45,7 @@ PostgreSQL, наприклад [DBeaver Community](https://dbeaver.io/download/)
 **Навички** (курс не про програмування, але код читати доведеться):
 
 - читаєш простий C# (методи, if, словники) — писати з нуля не треба:
-  всі місця підписані `TODO(student, W#)`;
+  що і коли дороблювати, перелічено в [GETTING_STARTED, §9](GETTING_STARTED.md#9-що-будуєш-ти-seamи);
 - читаєш простий Python (evals — один файл на stdlib);
 - базовий SQL: `SELECT`, `WHERE`, `GROUP BY`;
 - git: clone, branch, commit, push, відкрити PR;

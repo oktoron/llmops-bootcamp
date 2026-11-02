@@ -398,14 +398,14 @@ public class ApprovalQueueTests
         var q = new ApprovalQueue(new TicketStore(), Ttl, time, log);
         var id = q.Enqueue("create_ticket", "Поверніть гроші за #123, секретна подробиця").Approval.Id;
         q.Enqueue("create_ticket", "Хочу повернути гроші");
-        Assert.Equal(0, q.ExpiredCount);
+        Assert.Equal(0, q.CountExpired());
 
         time.Advance(Ttl + TimeSpan.FromSeconds(5));
         q.List();
         q.List();                                // повторний List не рахує ту саму заявку вдруге
         Assert.Null(q.Approve(id, "late"));      // і approve на протерміновану — теж
 
-        Assert.Equal(2, q.ExpiredCount);
+        Assert.Equal(2, q.CountExpired());
         var lines = log.Lines.Where(l => l.Contains("expired")).ToList();
         Assert.Equal(2, lines.Count);
         var line = Assert.Single(lines, l => l.Contains(id));
@@ -413,6 +413,29 @@ public class ApprovalQueueTests
         Assert.Contains("905", line);
         Assert.All(lines, l => Assert.DoesNotContain("гроші", l));
         Assert.All(lines, l => Assert.DoesNotContain("секретна", l));
+    }
+
+    // консоль закрита, List ніхто не кличе: лічильник однаково показує протерміновані, а повторні читання
+    // і пізніший List не рахують і не логують їх удруге
+    [Fact]
+    public void CountExpired_WithoutList_CountsDueOnce()
+    {
+        var log = new ListLogger();
+        var time = new ManualTimeProvider();
+        var q = new ApprovalQueue(new TicketStore(), Ttl, time, log);
+        q.Enqueue("create_ticket", "refund #1");
+        q.Enqueue("create_ticket", "Хочу повернути гроші");
+
+        time.Advance(Ttl - TimeSpan.FromSeconds(1));
+        Assert.Equal(0, q.CountExpired());       // ще не настало — заявки чекають далі
+        Assert.Equal(2, q.List().Pending.Count);
+
+        time.Advance(TimeSpan.FromSeconds(1));
+        Assert.Equal(2, q.CountExpired());
+        Assert.Equal(2, q.CountExpired());
+        Assert.Equal(2, q.List().Expired.Count);
+        Assert.Equal(2, q.CountExpired());
+        Assert.Equal(2, log.Lines.Count(l => l.Contains("expired")));
     }
 
     // гонка: протермінування в GET /approvals проти нової заявки з тим самим ключем. хто б не виграв,

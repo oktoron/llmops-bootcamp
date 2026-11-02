@@ -29,11 +29,33 @@ jobs:
             code=$(curl -s -o /dev/null -w "%{http_code}" -X POST http://localhost:4000/v1/chat/completions \
               -H "Content-Type: application/json" \
               -d '{"model":"mock","messages":[{"role":"user","content":"hi"}]}' || true)
-            if [ "$code" = "200" ]; then exit 0; fi
+            # будь-який 2xx — шлюз готовий; на відмову з'єднання curl дає 000
+            case "$code" in
+              2??) exit 0 ;;
+            esac
             sleep 5
           done
-          echo "gateway not ready"
+          echo "gateway not ready (last code: $code)"
           docker compose logs gateway
+          exit 1
+
+      # /health не торкається Postgres: поки initdb ще виконує db/schema.sql, перші кейси
+      # отримали б 503 замість відповіді. Чекаємо, доки реєстр промптів читається і має
+      # активну версію. Це очікування готовності стеку, не повтор evals: самі evals
+      # запускаються рівно один раз.
+      - name: Wait for prompt registry
+        run: |
+          body="${RUNNER_TEMP:-/tmp}/prompts.json"
+          for i in $(seq 1 40); do
+            code=$(curl -s -o "$body" -w "%{http_code}" http://localhost:8080/prompts || true)
+            case "$code" in
+              200) if grep -q '"active":true' "$body"; then exit 0; fi ;;
+            esac
+            sleep 5
+          done
+          echo "prompt registry not ready (last code: $code)"
+          cat "$body" || true
+          docker compose logs service postgres
           exit 1
 
       - uses: actions/setup-python@v5

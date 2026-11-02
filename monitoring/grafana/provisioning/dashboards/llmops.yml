@@ -1,0 +1,9 @@
+# дашборд читається з файлу; зміни в UI свідомо не зберігаються — джерело правди в git
+apiVersion: 1
+
+providers:
+  - name: llmops
+    type: file
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards

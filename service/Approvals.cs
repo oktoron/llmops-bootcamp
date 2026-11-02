@@ -118,8 +118,16 @@ public sealed class ApprovalQueue
     public TimeSpan Ttl { get; }
 
     // скільки заявок протермінувалось з моменту старту процесу (лічильник у пам'яті, як ModelClient.FallbackEvents).
-    // на відміну від списку expired у GET /approvals, обрізання до MaxFinished його не зменшує
-    public long ExpiredCount => Interlocked.Read(ref _expired);
+    // на відміну від списку expired у GET /approvals, обрізання до MaxFinished його не зменшує.
+    // протермінування ліниве, тож читання спершу завершує ті, що вже настали (як List): інакше лічильник стояв би,
+    // поки ніхто не відкриє консоль. ExpireIfDue рахує заявку один раз, хоч би скільки разів її перевіряли
+    public long CountExpired()
+    {
+        var now = _time.GetUtcNow();
+        foreach (var a in _items.Values)
+            ExpireIfDue(a, now);
+        return Interlocked.Read(ref _expired);
+    }
 
     public ApprovalQueue(ITicketStore tickets, TimeSpan ttl, TimeProvider time, ILogger? log = null)
     {

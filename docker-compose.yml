@@ -54,5 +54,34 @@ services:
     profiles: ["advanced"]
     ports: ["6379:6379"]
 
+  # метрики (HW6, опційно): Prometheus опитує GET /metrics сервісу, Grafana показує дашборд.
+  # історія Prometheus — в анонімному томі образу: up її успадковує, після down новий контейнер стартує порожнім; у Grafana тому немає
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    profiles: ["advanced"]
+    ports: ["9090:9090"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    depends_on: [service]
+
+  grafana:
+    image: grafana/grafana:13.2.4
+    profiles: ["advanced"]
+    ports: ["3000:3000"]
+    # анонімний перегляд — щоб ніхто не логінився; лише для локального запуску.
+    # перевірки оновлень і попереднє встановлення плагінів вимкнені: стек не ходить у мережу по них
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_ANALYTICS_CHECK_FOR_UPDATES=false
+      - GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES=false
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_PLUGINS_PREINSTALL_DISABLED=true
+    volumes:
+      - ./monitoring/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./monitoring/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
+    depends_on: [prometheus]
+
 volumes:
   pgdata:
