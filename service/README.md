@@ -12,4 +12,4 @@
 
 LiteLLM викликається лише для самого запиту до обраної моделі.
 
-Skeleton готовий: `Program.cs` (`/chat` + API-контракт `/observability` `/cost` `/prompts` `/health` `/approvals`), `Service.csproj`, `Dockerfile`. Місця для дороблення позначені `TODO(student)`.
+Skeleton готовий: `Program.cs` (`/chat` + API-контракт `/observability` `/cost` `/prompts` `/health` `/approvals`), `Service.csproj`, `Dockerfile`. Позначок `TODO(student)` у `service/` немає: що і коли дороблювати, див. [GETTING_STARTED.md, §9](../GETTING_STARTED.md#9-що-будуєш-ти-seamи).

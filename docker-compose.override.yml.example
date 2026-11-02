@@ -23,3 +23,8 @@ services:
   # redis піднімається лише з профілем advanced — розкоментуй, якщо 6379 зайнятий
   # redis:
   #   ports: !override ["16379:6379"]
+  # prometheus і grafana теж лише з профілем advanced — розкоментуй, якщо 9090 чи 3000 зайняті
+  # prometheus:
+  #   ports: !override ["19090:9090"]
+  # grafana:
+  #   ports: !override ["13000:3000"]

@@ -309,11 +309,11 @@ app.MapGet("/observability", async () =>
         app.Logger.LogWarning("requests table unavailable ({Error}), GET /observability returns in-memory fields only", ex.Message);
     }
     // решта полів — лічильники в пам'яті з моменту старту: див. Observability.HitPct, ModelClient.FallbackEvents,
-    // ToolRunner.Timeouts, GarbageReplyCounter, ModelClient.CircuitStates, ApprovalQueue.ExpiredCount.
+    // ToolRunner.Timeouts, GarbageReplyCounter, ModelClient.CircuitStates, ApprovalQueue.CountExpired.
     // errors, circuits і approvals_expired консоль не читає — це для ручної перевірки стану без читання логів
     return Results.Json(Observability.ObservabilityResponse(day,
         Observability.HitPct(responseCache.Hits, responseCache.Misses), modelClient.FallbackEvents,
-        toolRunner.Timeouts, garbageReplies.Count, modelClient.CircuitStates(), approvalQueue.ExpiredCount));
+        toolRunner.Timeouts, garbageReplies.Count, modelClient.CircuitStates(), approvalQueue.CountExpired()));
 });
 app.MapGet("/cost", async () =>                                                                    // W2/W5: { today_usd, budget_usd }
 {
@@ -328,6 +328,31 @@ app.MapGet("/cost", async () =>                                                 
         app.Logger.LogError(ex, "requests table unavailable, GET /cost failed");
         return Results.Json(new { error = "cost unavailable" }, statusCode: 503);
     }
+});
+// HW6 (опційно): текстовий формат Prometheus, не для консолі. лічильники llmops_*_total — з пам'яті, з моменту старту;
+// gauge llmops_*_today — з requests за сьогодні, значення ті самі, що в /observability і /cost (див. Metrics.Format).
+// база зупинена або відмовляє у з'єднанні — HTTP 200, llmops_db_up 0, а серій із бази немає зовсім: 0 читався б як
+// здоровий error rate. база, що зависла, може не встигнути відповісти: тоді скрейп упаде за тайм-аутом і на час збою
+// зникнуть усі серії, не лише серії з бази.
+// скрейп не пише рядка в requests, не викликає модель, успішний — не логується. єдиний побічний ефект: читання
+// завершує протермінування заявок, що вже настали, як і GET /approvals (ApprovalQueue.CountExpired)
+app.MapGet("/metrics", async () =>
+{
+    DaySummary? day = null;
+    decimal? costToday = null;
+    try
+    {
+        day = await Observability.TodayAsync(dbConn);
+        costToday = await CostToday(dbConn);
+    }
+    catch (Exception ex)
+    {
+        // один рядок без стек-трейсу: Prometheus опитує цей ендпоінт періодично
+        app.Logger.LogWarning("requests table unavailable ({Error}), GET /metrics omits DB series", ex.Message);
+    }
+    return Results.Text(Metrics.Format(new MetricsSnapshot(modelClient.FallbackEvents, responseCache.Hits, responseCache.Misses,
+        garbageReplies.Count, toolRunner.Timeouts, approvalQueue.CountExpired(), budgetUsd, modelClient.CircuitStates(),
+        day, costToday)), Metrics.ContentType);
 });
 app.MapGet("/prompts", async () =>                                                                 // W1/W2: [ { name, version, active, activated_by, created_at, activated_at } ]
 {

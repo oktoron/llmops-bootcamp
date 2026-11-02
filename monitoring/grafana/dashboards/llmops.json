@@ -1,0 +1,156 @@
+{
+  "uid": "llmops",
+  "title": "LLMOps: сервіс",
+  "tags": ["llmops"],
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Fallback за 15 хв",
+      "description": "Переходи на наступну модель ланцюжка. Лічильник у пам'яті: increase() переживає перезапуск сервісу.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "increase(llmops_fallback_events_total[15m])", "legendFormat": "fallback" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Частка помилок за сьогодні",
+      "description": "Те саме значення, що error_rate_pct в /observability. Опівночі падає разом із днем.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "llmops_error_rate_pct_today", "legendFormat": "помилки" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "p95 затримки за сьогодні",
+      "description": "Те саме значення, що p95_ms в /observability.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "ms", "min": 0 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "llmops_latency_p95_ms_today", "legendFormat": "p95" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Hit кешу за 15 хв",
+      "description": "Без звернень до кешу за вікно значення немає: ділення 0 на 0.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "percent", "min": 0, "max": 100 }, "overrides": [] },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "100 * increase(llmops_cache_hits_total[15m]) / (increase(llmops_cache_hits_total[15m]) + increase(llmops_cache_misses_total[15m]))",
+          "legendFormat": "hit"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Витрати проти бюджету",
+      "description": "Витрати за сьогодні і денний бюджет, USD. Реальна модель пише cost_usd = NULL, тож тут її не видно.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "min": 0 }, "overrides": [] },
+      "targets": [
+        { "refId": "A", "expr": "llmops_cost_today_usd", "legendFormat": "витрати" },
+        { "refId": "B", "expr": "llmops_budget_usd", "legendFormat": "бюджет" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Запобіжники",
+      "description": "Стан circuit breaker кожної моделі зараз. No data — немає свіжого значення: дивись панель «Збір метрик».",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 16 },
+      "options": { "colorMode": "background", "graphMode": "none", "textMode": "value_and_name" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "closed", "color": "green", "index": 0 },
+                "1": { "text": "half_open", "color": "yellow", "index": 1 },
+                "2": { "text": "open", "color": "red", "index": 2 }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "llmops_circuit_state", "legendFormat": "{{model}}", "instant": true, "range": false }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "База",
+      "description": "0 — база недоступна, і серій за сьогодні немає: порожні панелі тоді не означають нуль. No data — немає свіжого значення: дивись панель «Збір метрик».",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 16 },
+      "options": { "colorMode": "background", "graphMode": "none" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "недоступна", "color": "red", "index": 0 },
+                "1": { "text": "працює", "color": "green", "index": 1 }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "llmops_db_up", "legendFormat": "база", "instant": true, "range": false }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Збір метрик",
+      "description": "Чи вдався останній скрейп /metrics. down — сервіс не відповів за scrape_timeout: графіки обриваються, а панелі стану показують No data.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 20 },
+      "options": { "colorMode": "background", "graphMode": "none" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "down", "color": "red", "index": 0 },
+                "1": { "text": "up", "color": "green", "index": 1 }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "targets": [
+        { "refId": "A", "expr": "up{job=\"service\"}", "legendFormat": "сервіс", "instant": true, "range": false }
+      ]
+    }
+  ]
+}
